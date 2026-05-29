@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+build/
+packages/web/dist/
+packages/server/dist/
+
+# Local data and runtime state
+data/
+*.pid
+*.log
+
+# Local config (contains absolute paths and per-user repo mapping)
+config.json
+config.local.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Tooling caches
+.eslintcache
+*.tsbuildinfo

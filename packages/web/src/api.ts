@@ -1,0 +1,184 @@
+export interface Repo {
+  id: number;
+  owner: string;
+  name: string;
+  localPath: string;
+}
+
+export interface PRListItem {
+  id: number;
+  number: number;
+  title: string;
+  state: string;
+  headRef: string;
+  baseRef: string;
+  url: string;
+  author: string | null;
+  updatedAt: string;
+  hasReview: boolean;
+  openThreads: number;
+}
+
+export interface Comment {
+  id: number;
+  author: "ai" | "user";
+  body: string;
+  headSha: string;
+  kind: string;
+  createdAt: string;
+}
+
+export interface Thread {
+  id: number;
+  filePath: string | null;
+  line: number | null;
+  side: "LEFT" | "RIGHT" | null;
+  severity: string | null;
+  status: "open" | "resolved";
+  stale: boolean;
+  firstSeenSha: string;
+  lastSeenSha: string;
+  comments: Comment[];
+}
+
+export interface PR {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  headSha: string;
+  baseSha: string;
+  headRef: string;
+  baseRef: string;
+  state: string;
+  url: string;
+  author: string | null;
+  updatedAt: string;
+}
+
+export interface PRDetail {
+  pr: PR;
+  repo: { id: number; owner: string; name: string };
+  threads: Thread[];
+}
+
+export interface ProviderStatus {
+  id: string;
+  displayName: string;
+  available: boolean;
+}
+
+export interface AppStatus {
+  providers: ProviderStatus[];
+  gh: { ok: boolean; message: string };
+  settings: { provider: string; port: number; host: string };
+}
+
+async function jsonReq<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const api = {
+  status: () => jsonReq<AppStatus>("/api/status"),
+  repos: () => jsonReq<Repo[]>("/api/repos"),
+  detectRepo: (localPath: string) =>
+    jsonReq<{ owner: string; name: string; localPath: string }>("/api/repos/detect", {
+      method: "POST",
+      body: JSON.stringify({ localPath }),
+    }),
+  addRepo: (localPath: string) =>
+    jsonReq<{ id: number; owner: string; name: string; localPath: string }>("/api/repos", {
+      method: "POST",
+      body: JSON.stringify({ localPath }),
+    }),
+  removeRepo: (repoId: number) =>
+    jsonReq<{ removed: { owner: string; name: string }; remaining: number }>(
+      `/api/repos/${repoId}`,
+      { method: "DELETE" },
+    ),
+  prs: (repoId: number) => jsonReq<PRListItem[]>(`/api/repos/${repoId}/prs`),
+  refreshPRs: (repoId: number) =>
+    jsonReq<PRListItem[]>(`/api/repos/${repoId}/prs/refresh`, { method: "POST" }),
+  pr: (prId: number) => jsonReq<PRDetail>(`/api/prs/${prId}`),
+  diff: async (prId: number): Promise<string> => {
+    const res = await fetch(`/api/prs/${prId}/diff`);
+    if (!res.ok) throw new Error(await res.text());
+    return res.text();
+  },
+  clearReview: (prId: number) =>
+    jsonReq<{ threads: number; comments: number; reviews: number }>(`/api/prs/${prId}/review`, {
+      method: "DELETE",
+    }),
+  skills: (repoId: number) => jsonReq<{ body: string }>(`/api/repos/${repoId}/skills`),
+  saveSkills: (repoId: number, body: string) =>
+    jsonReq<{ body: string }>(`/api/repos/${repoId}/skills`, {
+      method: "PUT",
+      body: JSON.stringify({ body }),
+    }),
+  setStatus: (threadId: number, status: "open" | "resolved") =>
+    jsonReq<{ ok: true }>(`/api/threads/${threadId}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status }),
+    }),
+  setProvider: (provider: string) =>
+    jsonReq<{ provider: string }>(`/api/settings`, {
+      method: "PUT",
+      body: JSON.stringify({ provider }),
+    }),
+};
+
+// SSE helper: POST + read SSE stream from the same response.
+export interface SseEvent {
+  event: string;
+  data: unknown;
+}
+
+export async function postSse(
+  url: string,
+  body: unknown,
+  onEvent: (evt: SseEvent) => void,
+): Promise<void> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    throw new Error(`${res.status}: ${text}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const events = buf.split("\n\n");
+    buf = events.pop() ?? "";
+    for (const block of events) {
+      const lines = block.split("\n");
+      let ev = "message";
+      const dataParts: string[] = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) ev = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataParts.push(line.slice(5).trim());
+      }
+      if (dataParts.length === 0) continue;
+      try {
+        const data = JSON.parse(dataParts.join("\n"));
+        onEvent({ event: ev, data });
+      } catch {
+        onEvent({ event: ev, data: dataParts.join("\n") });
+      }
+    }
+  }
+}

@@ -1,0 +1,74 @@
+export interface ReviewComment {
+  path: string | null;
+  line: number | null;
+  side: "LEFT" | "RIGHT" | null;
+  severity: "blocker" | "concern" | "nit" | "praise";
+  body: string;
+}
+
+export interface ReviewResult {
+  summary: string;
+  comments: ReviewComment[];
+  rawOutput: string;
+}
+
+export interface ReviewContext {
+  cwd: string; // local working copy of the repo
+  prTitle: string;
+  prBody: string;
+  prNumber: number;
+  repoSlug: string; // owner/name
+  headSha: string;
+  baseSha: string;
+  diff: string; // unified diff (may be chunked by caller)
+  skills: string; // per-repo notes/rules markdown
+  existingOpenThreads: { path: string | null; line: number | null; summary: string }[];
+}
+
+export interface ReplyContext {
+  cwd: string;
+  prTitle: string;
+  prNumber: number;
+  repoSlug: string;
+  headSha: string;
+  threadAnchor: { path: string | null; line: number | null };
+  threadHistory: { author: "ai" | "user"; body: string }[];
+  userMessage: string;
+  skills: string;
+}
+
+export interface RevalidateContext {
+  cwd: string;
+  prTitle: string;
+  prNumber: number;
+  repoSlug: string;
+  headSha: string;
+  baseSha: string;
+  threadAnchor: { path: string | null; line: number | null };
+  threadHistory: { author: "ai" | "user"; body: string }[];
+  skills: string;
+}
+
+export interface RevalidateResult {
+  resolved: boolean;
+  body: string; // explanation: why resolved, or what's still missing
+  rawOutput: string;
+}
+
+export interface ReplyResult {
+  body: string;
+  rawOutput: string;
+}
+
+export interface ProviderProgress {
+  (event: { type: "log" | "stdout" | "stderr"; data: string }): void;
+}
+
+export interface Provider {
+  id: "claude" | "gemini" | string;
+  displayName: string;
+  isAvailable(): Promise<boolean>;
+  review(ctx: ReviewContext, onProgress?: ProviderProgress): Promise<ReviewResult>;
+  reply(ctx: ReplyContext, onProgress?: ProviderProgress): Promise<ReplyResult>;
+  revalidate(ctx: RevalidateContext, onProgress?: ProviderProgress): Promise<RevalidateResult>;
+}

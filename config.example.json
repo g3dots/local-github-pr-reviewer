@@ -1,0 +1,11 @@
+{
+  "provider": "claude",
+  "port": 47823,
+  "repos": [
+    {
+      "owner": "your-github-username",
+      "name": "your-repo",
+      "localPath": "/absolute/path/to/your/clone"
+    }
+  ]
+}

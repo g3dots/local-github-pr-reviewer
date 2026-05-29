@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+coverage/
+data/
+packages/web/dist/
+packages/server/dist/
+*.lock
+package-lock.json

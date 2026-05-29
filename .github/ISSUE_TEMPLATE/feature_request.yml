@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a change or addition.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that this tool makes harder than it should be?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Optional. If you have an idea, sketch it here.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional.
+  - type: checkboxes
+    id: principles
+    attributes:
+      label: Project principles
+      description: Skim CONTRIBUTING.md if you haven't.
+      options:
+        - label: This proposal does not require writing back to GitHub.
+          required: true
+        - label: This proposal is compatible with running entirely on a single user's machine (no hosted services, no telemetry).
+          required: true

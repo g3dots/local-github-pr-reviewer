@@ -1,0 +1,50 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what actually happened?
+      placeholder: |
+        1. I configured repo X
+        2. I clicked Run review
+        3. The reviewer crashed / never returned / posted ten praise comments / ...
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Active AI provider
+      placeholder: "claude or gemini"
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: |
+        Output of:
+        ```
+        node --version
+        gh --version | head -1
+        claude --version 2>/dev/null || true
+        gemini --version 2>/dev/null || true
+        ```
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant server log
+      description: Anything around the error in the terminal where you ran `npm start`.
+      render: shell
+  - type: checkboxes
+    id: read-only
+    attributes:
+      label: Read-only contract
+      options:
+        - label: I can confirm this bug does not involve the tool writing to GitHub. (If it does, please use a security advisory instead — see SECURITY.md.)
+          required: true

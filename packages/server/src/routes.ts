@@ -1,0 +1,292 @@
+import type { FastifyInstance, FastifyReply } from "fastify";
+import { z } from "zod";
+import {
+  listRepos,
+  getRepo,
+  findRepoByOwnerName,
+  syncReposFromConfig,
+  getDb,
+  type RepoRow,
+} from "./db.js";
+import { addRepoToConfig, removeRepoFromConfig } from "./config.js";
+import { detectRepo } from "./repoDetect.js";
+import {
+  listPRsForRepo,
+  refreshOpenPRs,
+  getPRById,
+  listThreadsForPR,
+  hydratePR,
+  clearReviewData,
+} from "./prs.js";
+import { getSkills, setSkills } from "./skills.js";
+import { runReview, runReply, runRevalidate, setThreadStatus } from "./review.js";
+import * as gh from "./github.js";
+import { listProviderStatus, getProvider } from "./providers/index.js";
+import { getSettings, setProvider } from "./settings.js";
+
+function sseInit(reply: FastifyReply): void {
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+}
+
+function sseSend(reply: FastifyReply, event: string, data: unknown): void {
+  reply.raw.write(`event: ${event}\n`);
+  reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sseEnd(reply: FastifyReply): void {
+  reply.raw.end();
+}
+
+function requireRepo(repoId: number): RepoRow {
+  const r = getRepo(repoId);
+  if (!r) throw new Error(`repo ${repoId} not found`);
+  return r;
+}
+
+export async function registerRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/api/status", async () => {
+    const [providers, auth] = await Promise.all([listProviderStatus(), gh.checkAuth()]);
+    const settings = getSettings();
+    return { providers, gh: auth, settings };
+  });
+
+  app.get("/api/settings", async () => getSettings());
+
+  app.put("/api/settings", async (req) => {
+    const body = z.object({ provider: z.string() }).parse(req.body);
+    const prov = getProvider(body.provider); // throws if unknown
+    setProvider(prov.id);
+    return getSettings();
+  });
+
+  app.get("/api/repos", async () => {
+    return listRepos().map((r) => ({
+      id: r.id,
+      owner: r.owner,
+      name: r.name,
+      localPath: r.local_path,
+    }));
+  });
+
+  app.post("/api/repos/detect", async (req) => {
+    const body = z.object({ localPath: z.string().min(1) }).parse(req.body);
+    const detected = await detectRepo(body.localPath);
+    return detected;
+  });
+
+  app.post("/api/repos", async (req) => {
+    const body = z.object({ localPath: z.string().min(1) }).parse(req.body);
+    const detected = await detectRepo(body.localPath);
+    const nextCfg = addRepoToConfig(detected);
+    syncReposFromConfig(nextCfg.repos);
+    const row = findRepoByOwnerName(detected.owner, detected.name);
+    return { ...detected, id: row?.id };
+  });
+
+  app.delete("/api/repos/:repoId", async (req) => {
+    const { repoId } = z.object({ repoId: z.coerce.number() }).parse(req.params);
+    const repo = requireRepo(repoId);
+    const nextCfg = removeRepoFromConfig(repo.owner, repo.name);
+    // Drop the repo row (cascades to PRs, threads, comments, skills).
+    getDb().prepare("DELETE FROM repos WHERE id = ?").run(repoId);
+    return { removed: { owner: repo.owner, name: repo.name }, remaining: nextCfg.repos.length };
+  });
+
+  app.get("/api/repos/:repoId/prs", async (req) => {
+    const { repoId } = z.object({ repoId: z.coerce.number() }).parse(req.params);
+    requireRepo(repoId);
+    return listPRsForRepo(repoId);
+  });
+
+  app.post("/api/repos/:repoId/prs/refresh", async (req) => {
+    const { repoId } = z.object({ repoId: z.coerce.number() }).parse(req.params);
+    const repo = requireRepo(repoId);
+    return refreshOpenPRs(repo);
+  });
+
+  app.get("/api/repos/:repoId/skills", async (req) => {
+    const { repoId } = z.object({ repoId: z.coerce.number() }).parse(req.params);
+    requireRepo(repoId);
+    return { body: getSkills(repoId) };
+  });
+
+  app.put("/api/repos/:repoId/skills", async (req) => {
+    const { repoId } = z.object({ repoId: z.coerce.number() }).parse(req.params);
+    requireRepo(repoId);
+    const body = z.object({ body: z.string() }).parse(req.body);
+    setSkills(repoId, body.body);
+    return { body: getSkills(repoId) };
+  });
+
+  app.get("/api/prs/:prId", async (req) => {
+    const { prId } = z.object({ prId: z.coerce.number() }).parse(req.params);
+    const pr = getPRById(prId);
+    if (!pr) throw new Error(`pr ${prId} not found`);
+    const repo = requireRepo(pr.repo_id);
+    const refreshed = await hydratePR(repo, pr.number);
+    const threads = listThreadsForPR(refreshed.id);
+    return {
+      pr: {
+        id: refreshed.id,
+        number: refreshed.number,
+        title: refreshed.title,
+        body: refreshed.body,
+        headSha: refreshed.head_sha,
+        baseSha: refreshed.base_sha,
+        headRef: refreshed.head_ref,
+        baseRef: refreshed.base_ref,
+        state: refreshed.state,
+        url: refreshed.url,
+        author: refreshed.author,
+        updatedAt: refreshed.updated_at,
+      },
+      repo: { id: repo.id, owner: repo.owner, name: repo.name },
+      threads: threads.map((t) => ({
+        id: t.id,
+        filePath: t.file_path,
+        line: t.line,
+        side: t.side,
+        severity: t.severity,
+        status: t.status,
+        stale: !!t.stale,
+        firstSeenSha: t.first_seen_sha,
+        lastSeenSha: t.last_seen_sha,
+        comments: t.comments.map((c) => ({
+          id: c.id,
+          author: c.author,
+          body: c.body,
+          headSha: c.head_sha,
+          kind: c.kind,
+          createdAt: c.created_at,
+        })),
+      })),
+    };
+  });
+
+  app.get("/api/prs/:prId/diff", async (req, reply) => {
+    const { prId } = z.object({ prId: z.coerce.number() }).parse(req.params);
+    const pr = getPRById(prId);
+    if (!pr) throw new Error(`pr ${prId} not found`);
+    const repo = requireRepo(pr.repo_id);
+    const diff = await gh.getPRDiff(repo.owner, repo.name, pr.number);
+    reply.header("content-type", "text/plain; charset=utf-8");
+    return diff;
+  });
+
+  app.get("/api/prs/:prId/files", async (req) => {
+    const { prId } = z.object({ prId: z.coerce.number() }).parse(req.params);
+    const pr = getPRById(prId);
+    if (!pr) throw new Error(`pr ${prId} not found`);
+    const repo = requireRepo(pr.repo_id);
+    return gh.getPRFiles(repo.owner, repo.name, pr.number);
+  });
+
+  // --- SSE actions ---
+
+  app.post("/api/prs/:prId/review", async (req, reply) => {
+    const { prId } = z.object({ prId: z.coerce.number() }).parse(req.params);
+    const pr = getPRById(prId);
+    if (!pr) throw new Error(`pr ${prId} not found`);
+    const repo = requireRepo(pr.repo_id);
+    const providerId = getSettings().provider;
+
+    sseInit(reply);
+    sseSend(reply, "log", { message: `starting review with ${providerId}…` });
+
+    try {
+      const result = await runReview({
+        repo,
+        pr,
+        providerId,
+        onProgress: (e) => sseSend(reply, e.type, e),
+      });
+      sseSend(reply, "done", result);
+    } catch (e) {
+      sseSend(reply, "error", { message: (e as Error).message });
+    } finally {
+      sseEnd(reply);
+    }
+  });
+
+  app.post("/api/threads/:threadId/messages", async (req, reply) => {
+    const { threadId } = z.object({ threadId: z.coerce.number() }).parse(req.params);
+    const body = z.object({ body: z.string().min(1) }).parse(req.body);
+    // We need the PR/repo for the thread.
+    const row = (await import("./db.js"))
+      .getDb()
+      .prepare("SELECT pr_id FROM threads WHERE id = ?")
+      .get(threadId) as { pr_id: number } | undefined;
+    if (!row) throw new Error("thread not found");
+    const pr = getPRById(row.pr_id);
+    if (!pr) throw new Error("pr not found");
+    const repo = requireRepo(pr.repo_id);
+    const providerId = getSettings().provider;
+
+    sseInit(reply);
+    sseSend(reply, "log", { message: `replying with ${providerId}…` });
+    try {
+      const result = await runReply({
+        repo,
+        pr,
+        threadId,
+        userMessage: body.body,
+        providerId,
+        onProgress: (e) => sseSend(reply, e.type, e),
+      });
+      sseSend(reply, "done", result);
+    } catch (e) {
+      sseSend(reply, "error", { message: (e as Error).message });
+    } finally {
+      sseEnd(reply);
+    }
+  });
+
+  app.post("/api/threads/:threadId/revalidate", async (req, reply) => {
+    const { threadId } = z.object({ threadId: z.coerce.number() }).parse(req.params);
+    const row = (await import("./db.js"))
+      .getDb()
+      .prepare("SELECT pr_id FROM threads WHERE id = ?")
+      .get(threadId) as { pr_id: number } | undefined;
+    if (!row) throw new Error("thread not found");
+    const pr = getPRById(row.pr_id);
+    if (!pr) throw new Error("pr not found");
+    const repo = requireRepo(pr.repo_id);
+    const providerId = getSettings().provider;
+
+    sseInit(reply);
+    sseSend(reply, "log", { message: `revalidating with ${providerId}…` });
+    try {
+      const result = await runRevalidate({
+        repo,
+        pr,
+        threadId,
+        providerId,
+        onProgress: (e) => sseSend(reply, e.type, e),
+      });
+      sseSend(reply, "done", result);
+    } catch (e) {
+      sseSend(reply, "error", { message: (e as Error).message });
+    } finally {
+      sseEnd(reply);
+    }
+  });
+
+  app.delete("/api/prs/:prId/review", async (req) => {
+    const { prId } = z.object({ prId: z.coerce.number() }).parse(req.params);
+    const pr = getPRById(prId);
+    if (!pr) throw new Error(`pr ${prId} not found`);
+    return clearReviewData(prId);
+  });
+
+  app.post("/api/threads/:threadId/status", async (req) => {
+    const { threadId } = z.object({ threadId: z.coerce.number() }).parse(req.params);
+    const body = z.object({ status: z.enum(["open", "resolved"]) }).parse(req.body);
+    setThreadStatus(threadId, body.status);
+    return { ok: true };
+  });
+}

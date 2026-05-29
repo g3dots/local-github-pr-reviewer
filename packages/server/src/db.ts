@@ -1,0 +1,182 @@
+import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { resolve } from "node:path";
+import { dataDir } from "./config.js";
+
+let dbInstance: Database.Database | null = null;
+
+export function getDb(): Database.Database {
+  if (dbInstance) return dbInstance;
+  mkdirSync(dataDir(), { recursive: true });
+  const db = new Database(resolve(dataDir(), "reviewer.db"));
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  migrate(db);
+  dbInstance = db;
+  return db;
+}
+
+function migrate(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS repos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner TEXT NOT NULL,
+      name TEXT NOT NULL,
+      local_path TEXT NOT NULL,
+      UNIQUE(owner, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS prs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+      number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      head_sha TEXT NOT NULL,
+      base_sha TEXT NOT NULL,
+      head_ref TEXT NOT NULL,
+      base_ref TEXT NOT NULL,
+      state TEXT NOT NULL,
+      url TEXT NOT NULL,
+      author TEXT,
+      updated_at TEXT NOT NULL,
+      UNIQUE(repo_id, number)
+    );
+
+    CREATE TABLE IF NOT EXISTS reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pr_id INTEGER NOT NULL REFERENCES prs(id) ON DELETE CASCADE,
+      head_sha TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      status TEXT NOT NULL,
+      summary TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      error TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS threads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pr_id INTEGER NOT NULL REFERENCES prs(id) ON DELETE CASCADE,
+      file_path TEXT,
+      line INTEGER,
+      side TEXT,
+      severity TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      first_seen_sha TEXT NOT NULL,
+      last_seen_sha TEXT NOT NULL,
+      stale INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+      author TEXT NOT NULL,
+      body TEXT NOT NULL,
+      head_sha TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'normal',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS skills (
+      repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+      body TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_threads_pr ON threads(pr_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_prs_repo ON prs(repo_id);
+  `);
+}
+
+// --- Row types ---
+
+export interface RepoRow {
+  id: number;
+  owner: string;
+  name: string;
+  local_path: string;
+}
+export interface PrRow {
+  id: number;
+  repo_id: number;
+  number: number;
+  title: string;
+  body: string;
+  head_sha: string;
+  base_sha: string;
+  head_ref: string;
+  base_ref: string;
+  state: string;
+  url: string;
+  author: string | null;
+  updated_at: string;
+}
+export interface ReviewRow {
+  id: number;
+  pr_id: number;
+  head_sha: string;
+  provider: string;
+  status: string;
+  summary: string | null;
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+}
+export interface ThreadRow {
+  id: number;
+  pr_id: number;
+  file_path: string | null;
+  line: number | null;
+  side: string | null;
+  severity: string | null;
+  status: string;
+  first_seen_sha: string;
+  last_seen_sha: string;
+  stale: number;
+  created_at: string;
+}
+export interface CommentRow {
+  id: number;
+  thread_id: number;
+  author: string;
+  body: string;
+  head_sha: string;
+  kind: string;
+  created_at: string;
+}
+export interface SkillsRow {
+  repo_id: number;
+  body: string;
+  updated_at: string;
+}
+
+// --- Repo upsert (driven by config.json) ---
+
+export function syncReposFromConfig(
+  repos: { owner: string; name: string; localPath: string }[],
+): RepoRow[] {
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT INTO repos (owner, name, local_path) VALUES (?, ?, ?)
+    ON CONFLICT(owner, name) DO UPDATE SET local_path = excluded.local_path
+  `);
+  for (const r of repos) stmt.run(r.owner, r.name, r.localPath);
+  return db.prepare("SELECT * FROM repos ORDER BY owner, name").all() as RepoRow[];
+}
+
+export function listRepos(): RepoRow[] {
+  return getDb().prepare("SELECT * FROM repos ORDER BY owner, name").all() as RepoRow[];
+}
+
+export function getRepo(id: number): RepoRow | undefined {
+  return getDb().prepare("SELECT * FROM repos WHERE id = ?").get(id) as RepoRow | undefined;
+}
+
+export function findRepoByOwnerName(owner: string, name: string): RepoRow | undefined {
+  return getDb().prepare("SELECT * FROM repos WHERE owner = ? AND name = ?").get(owner, name) as
+    | RepoRow
+    | undefined;
+}
