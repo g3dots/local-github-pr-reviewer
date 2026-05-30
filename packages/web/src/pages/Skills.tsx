@@ -26,7 +26,7 @@ export function Skills() {
   return (
     <div className="skills-page">
       <header className="page-header">
-        <Link to="/" className="muted">
+        <Link to="/" className="back-link">
           ← All PRs
         </Link>
         <h1>Reviewer rules for this repo</h1>

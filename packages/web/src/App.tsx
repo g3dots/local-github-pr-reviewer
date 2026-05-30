@@ -19,7 +19,10 @@ export function App() {
     <div className="app">
       <nav className="topbar">
         <Link to="/" className="brand">
-          Reviewer
+          <span className="mark">R</span>
+          <span>Reviewer</span>
+          <span className="brand-sep">/</span>
+          <span className="brand-sub">pull requests</span>
         </Link>
         <div className="spacer" />
         <button
@@ -29,7 +32,9 @@ export function App() {
         >
           {ICON[theme]} {LABEL[theme]}
         </button>
-        <Link to="/settings">Settings</Link>
+        <Link to="/settings" className="nav-link">
+          Settings
+        </Link>
       </nav>
       <main className="main">
         <Outlet />
