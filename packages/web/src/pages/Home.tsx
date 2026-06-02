@@ -101,13 +101,14 @@ export function Home() {
           <ul className="pr-list">
             {(prs[repo.id] ?? []).map((p) => (
               <li key={p.id} className="pr-row">
+                <span className="pr-num">#{p.number}</span>
                 <Link to={`/pr/${p.id}`} className="pr-title">
-                  #{p.number} {p.title}
+                  {p.title}
                 </Link>
-                <span className="muted small">
+                <span className="branch">
                   {p.headRef} → {p.baseRef}
                 </span>
-                <span className="muted small">{p.author ?? ""}</span>
+                {p.author && <span className="muted small">{p.author}</span>}
                 <div className="spacer" />
                 {p.hasReview && <span className="pill ok">reviewed</span>}
                 {p.openThreads > 0 && <span className="pill">{p.openThreads} open</span>}

@@ -16,6 +16,57 @@ export interface DiffFile {
   hunks: DiffHunk[];
 }
 
+/** A single file's slice of a multi-file unified diff, kept as raw patch text. */
+export interface PatchFile {
+  /** Display path — the new path, or the old path for deletions. */
+  path: string;
+  /** Raw `diff --git …` block for this one file, ready to hand to a renderer. */
+  patch: string;
+}
+
+/**
+ * Split a raw multi-file `git diff` into one self-contained patch per file.
+ *
+ * Unlike {@link parseUnifiedDiff}, this preserves the original patch text so it
+ * can be handed verbatim to a diff renderer (e.g. `@pierre/diffs`' `PatchDiff`),
+ * which does its own parsing and syntax highlighting.
+ */
+export function splitPatchByFile(raw: string): PatchFile[] {
+  const out: PatchFile[] = [];
+  const lines = raw.split("\n");
+  let start = -1;
+  const flush = (end: number) => {
+    if (start < 0) return;
+    const block = lines.slice(start, end);
+    out.push({ path: pathFromBlock(block), patch: block.join("\n") });
+  };
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.startsWith("diff --git")) {
+      flush(i);
+      start = i;
+    }
+  }
+  flush(lines.length);
+  return out;
+}
+
+function pathFromBlock(block: string[]): string {
+  let oldPath: string | null = null;
+  let newPath: string | null = null;
+  for (const l of block) {
+    if (l.startsWith("+++ b/")) newPath = l.slice(6);
+    else if (l.startsWith("+++ ")) newPath = l.slice(4) === "/dev/null" ? null : l.slice(4);
+    else if (l.startsWith("--- a/")) oldPath = l.slice(6);
+    else if (l.startsWith("--- ")) oldPath = l.slice(4) === "/dev/null" ? null : l.slice(4);
+    if (newPath) break;
+  }
+  if (newPath) return newPath;
+  if (oldPath) return oldPath;
+  // Fall back to the `diff --git a/x b/y` header.
+  const m = block[0]?.match(/^diff --git a\/(.+) b\/(.+)$/);
+  return m ? m[2]! : "(unknown)";
+}
+
 export function parseUnifiedDiff(raw: string): DiffFile[] {
   const files: DiffFile[] = [];
   const lines = raw.split("\n");

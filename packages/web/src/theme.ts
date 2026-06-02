@@ -20,3 +20,18 @@ export function applyTheme(t: Theme): void {
 export function initTheme(): void {
   applyTheme(getTheme());
 }
+
+/**
+ * Subscribe to the active theme by observing `data-theme` on <html>, so renderers
+ * that take an explicit theme (e.g. `@pierre/diffs`) re-render when the user
+ * toggles it. Returns the current value and an unsubscribe fn.
+ */
+export function subscribeTheme(cb: (t: Theme) => void): () => void {
+  const read = (): Theme => {
+    const v = document.documentElement.getAttribute("data-theme");
+    return v === "dark" || v === "light" || v === "system" ? v : "system";
+  };
+  const obs = new MutationObserver(() => cb(read()));
+  obs.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  return () => obs.disconnect();
+}

@@ -2,8 +2,22 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { PatchDiff, type DiffLineAnnotation } from "@pierre/diffs/react";
 import { api, postSse, type PRDetail, type Thread } from "../api.js";
-import { parseUnifiedDiff, type DiffFile, type DiffLine } from "../diff.js";
+import { splitPatchByFile, type PatchFile } from "../diff.js";
+import { getTheme, subscribeTheme, type Theme } from "../theme.js";
+
+type ViewMode = "unified" | "split";
+
+/** Threads anchored to a single diff line, carried as Pierre annotation metadata. */
+type LineThreads = DiffLineAnnotation<Thread[]>;
+
+/** Live theme value, so Pierre re-highlights when the user toggles light/dark. */
+function useThemeType(): Theme {
+  const [theme, setThemeState] = useState<Theme>(() => getTheme());
+  useEffect(() => subscribeTheme(setThemeState), []);
+  return theme;
+}
 
 type StreamState = {
   active: boolean;
@@ -28,33 +42,52 @@ export function PRView() {
     void load();
   }, [load]);
 
-  const files = useMemo<DiffFile[]>(() => (diff ? parseUnifiedDiff(diff) : []), [diff]);
+  const files = useMemo<PatchFile[]>(() => (diff ? splitPatchByFile(diff) : []), [diff]);
 
-  // Group threads by file+line for fast lookup.
+  // Group threads for lookup: PR-level, file-level, and inline → Pierre annotations.
   const threadIndex = useMemo(() => {
-    const idx = new Map<string, Thread[]>();
     const fileLevel = new Map<string, Thread[]>();
     const prLevel: Thread[] = [];
-    if (!detail) return { idx, fileLevel, prLevel };
+    // file → "line:side" → threads, so several threads on one line collapse to one annotation.
+    const inline = new Map<string, Map<string, Thread[]>>();
+    if (!detail) return { annByFile: new Map<string, LineThreads[]>(), fileLevel, prLevel };
     for (const t of detail.threads) {
       if (!t.filePath) {
         prLevel.push(t);
         continue;
       }
       if (t.line == null) {
-        const k = t.filePath;
-        const arr = fileLevel.get(k) ?? [];
+        const arr = fileLevel.get(t.filePath) ?? [];
         arr.push(t);
-        fileLevel.set(k, arr);
+        fileLevel.set(t.filePath, arr);
         continue;
       }
-      const k = `${t.filePath}:${t.line}:${t.side ?? "RIGHT"}`;
-      const arr = idx.get(k) ?? [];
+      const side = t.side === "LEFT" ? "deletions" : "additions";
+      const byLine = inline.get(t.filePath) ?? new Map<string, Thread[]>();
+      const key = `${t.line}:${side}`;
+      const arr = byLine.get(key) ?? [];
       arr.push(t);
-      idx.set(k, arr);
+      byLine.set(key, arr);
+      inline.set(t.filePath, byLine);
     }
-    return { idx, fileLevel, prLevel };
+    const annByFile = new Map<string, LineThreads[]>();
+    for (const [path, byLine] of inline) {
+      const anns: LineThreads[] = [];
+      for (const [key, threads] of byLine) {
+        const [line, side] = key.split(":");
+        anns.push({
+          side: side as "additions" | "deletions",
+          lineNumber: Number(line),
+          metadata: threads,
+        });
+      }
+      annByFile.set(path, anns);
+    }
+    return { annByFile, fileLevel, prLevel };
   }, [detail]);
+
+  const themeType = useThemeType();
+  const [viewMode, setViewMode] = useState<ViewMode>("unified");
 
   const clearReview = useCallback(async () => {
     const ok = window.confirm(
@@ -103,7 +136,7 @@ export function PRView() {
     <div className="prview">
       <header className="pr-header">
         <div>
-          <Link to="/" className="muted">
+          <Link to="/" className="back-link">
             ← All PRs
           </Link>
           <h1>
@@ -118,6 +151,24 @@ export function PRView() {
           </div>
         </div>
         <div className="spacer" />
+        <div className="view-toggle" role="tablist" aria-label="Diff layout">
+          <button
+            role="tab"
+            aria-selected={viewMode === "unified"}
+            className={viewMode === "unified" ? "active" : ""}
+            onClick={() => setViewMode("unified")}
+          >
+            Unified
+          </button>
+          <button
+            role="tab"
+            aria-selected={viewMode === "split"}
+            className={viewMode === "split" ? "active" : ""}
+            onClick={() => setViewMode("split")}
+          >
+            Split
+          </button>
+        </div>
         {detail.threads.length > 0 && (
           <button className="btn" onClick={clearReview} disabled={stream.active}>
             Clear review
@@ -148,10 +199,12 @@ export function PRView() {
       <section className="diff">
         {files.map((f) => (
           <FileBlock
-            key={f.newPath}
+            key={f.path}
             file={f}
-            threadIndex={threadIndex.idx}
-            fileThreads={threadIndex.fileLevel.get(f.newPath) ?? []}
+            annotations={threadIndex.annByFile.get(f.path) ?? []}
+            fileThreads={threadIndex.fileLevel.get(f.path) ?? []}
+            themeType={themeType}
+            viewMode={viewMode}
             onChange={load}
           />
         ))}
@@ -169,86 +222,62 @@ export function PRView() {
   );
 }
 
+const PIERRE_THEME = { dark: "pierre-dark", light: "pierre-light" } as const;
+
 function FileBlock({
   file,
-  threadIndex,
+  annotations,
   fileThreads,
+  themeType,
+  viewMode,
   onChange,
 }: {
-  file: DiffFile;
-  threadIndex: Map<string, Thread[]>;
+  file: PatchFile;
+  annotations: LineThreads[];
   fileThreads: Thread[];
+  themeType: Theme;
+  viewMode: ViewMode;
   onChange: () => void;
 }) {
+  const openCount = annotations.reduce(
+    (n, a) => n + a.metadata.filter((t) => t.status === "open").length,
+    0,
+  );
   return (
     <div className="file-block">
-      <div className="file-header">{file.newPath}</div>
-      {fileThreads.map((t) => (
-        <ThreadCard key={t.id} thread={t} onChange={onChange} />
-      ))}
-      <table className="diff-table">
-        <tbody>
-          {file.hunks.flatMap((h, hi) => [
-            <tr key={`h${hi}`} className="hunk-row">
-              <td colSpan={3}>{h.header}</td>
-            </tr>,
-            ...h.lines.map((l, li) =>
-              renderDiffLine(file.newPath, l, hi, li, threadIndex, onChange),
-            ),
-          ])}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function renderDiffLine(
-  path: string,
-  l: DiffLine,
-  hi: number,
-  li: number,
-  threadIndex: Map<string, Thread[]>,
-  onChange: () => void,
-): React.ReactNode[] {
-  if (l.kind === "hunk") return [];
-  if (l.kind === "meta") {
-    return [
-      <tr key={`${hi}-${li}-m`} className="meta-row">
-        <td colSpan={3}>{l.text}</td>
-      </tr>,
-    ];
-  }
-  const cls = l.kind === "add" ? "add" : l.kind === "del" ? "del" : "ctx";
-  const key = l.kind === "del" ? null : `${path}:${l.newLine}:RIGHT`;
-  const threads = key ? (threadIndex.get(key) ?? []) : [];
-  const rows: React.ReactNode[] = [
-    <tr key={`${hi}-${li}`} className={`diff-line ${cls}`}>
-      <td className="ln old">{l.oldLine ?? ""}</td>
-      <td className="ln new">{l.newLine ?? ""}</td>
-      <td className="code">
-        <pre>
-          {lineSign(l.kind)}
-          {l.text}
-        </pre>
-      </td>
-    </tr>,
-  ];
-  if (threads.length > 0) {
-    rows.push(
-      <tr key={`${hi}-${li}-th`} className="thread-row">
-        <td colSpan={3}>
-          {threads.map((t) => (
+      {fileThreads.length > 0 && (
+        <div className="file-threads">
+          {fileThreads.map((t) => (
             <ThreadCard key={t.id} thread={t} onChange={onChange} />
           ))}
-        </td>
-      </tr>,
-    );
-  }
-  return rows;
-}
-
-function lineSign(k: DiffLine["kind"]): string {
-  return k === "add" ? "+ " : k === "del" ? "- " : "  ";
+        </div>
+      )}
+      <PatchDiff<Thread[]>
+        patch={file.patch}
+        className="pierre-diff"
+        options={{
+          theme: PIERRE_THEME,
+          themeType,
+          diffStyle: viewMode,
+          diffIndicators: "bars",
+          lineDiffType: "word",
+          overflow: "wrap",
+          stickyHeader: true,
+        }}
+        lineAnnotations={annotations}
+        renderHeaderMetadata={() =>
+          openCount > 0 ? <span className="file-badge">{openCount} open</span> : null
+        }
+        renderAnnotation={(a) => (
+          <div className="pierre-annotation">
+            {a.metadata.map((t) => (
+              <ThreadCard key={t.id} thread={t} onChange={onChange} />
+            ))}
+          </div>
+        )}
+      />
+    </div>
+  );
 }
 
 function ThreadCard({

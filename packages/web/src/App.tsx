@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, Outlet } from "react-router-dom";
+import { Link, Outlet, useLocation } from "react-router-dom";
 import { getTheme, setTheme, type Theme } from "./theme.js";
 
 const NEXT: Record<Theme, Theme> = { system: "dark", dark: "light", light: "system" };
@@ -8,6 +8,8 @@ const LABEL: Record<Theme, string> = { system: "System", dark: "Dark", light: "L
 
 export function App() {
   const [theme, setT] = useState<Theme>(getTheme());
+  const location = useLocation();
+  const mainClassName = location.pathname.startsWith("/pr/") ? "main main-prview" : "main";
 
   function cycle() {
     const next = NEXT[theme];
@@ -19,7 +21,10 @@ export function App() {
     <div className="app">
       <nav className="topbar">
         <Link to="/" className="brand">
-          Reviewer
+          <span className="mark">R</span>
+          <span>Reviewer</span>
+          <span className="brand-sep">/</span>
+          <span className="brand-sub">pull requests</span>
         </Link>
         <div className="spacer" />
         <button
@@ -29,9 +34,11 @@ export function App() {
         >
           {ICON[theme]} {LABEL[theme]}
         </button>
-        <Link to="/settings">Settings</Link>
+        <Link to="/settings" className="nav-link">
+          Settings
+        </Link>
       </nav>
-      <main className="main">
+      <main className={mainClassName}>
         <Outlet />
       </main>
     </div>
