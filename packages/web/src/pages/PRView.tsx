@@ -261,6 +261,7 @@ function FileBlock({
           diffStyle: viewMode,
           diffIndicators: "bars",
           lineDiffType: "word",
+          overflow: "wrap",
           stickyHeader: true,
         }}
         lineAnnotations={annotations}

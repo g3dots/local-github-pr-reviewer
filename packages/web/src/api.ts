@@ -77,7 +77,9 @@ export interface AppStatus {
 async function jsonReq<T>(url: string, init?: RequestInit): Promise<T> {
   // Only set Content-Type when we actually have a body. Fastify rejects
   // bodyless requests that declare application/json as malformed.
-  const headers: Record<string, string> = { ...(init?.headers as Record<string, string> | undefined) };
+  const headers: Record<string, string> = {
+    ...(init?.headers as Record<string, string> | undefined),
+  };
   if (init?.body !== undefined && headers["Content-Type"] === undefined) {
     headers["Content-Type"] = "application/json";
   }

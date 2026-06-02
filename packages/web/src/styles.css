@@ -300,6 +300,10 @@ pre {
   width: 100%;
   margin: 0 auto;
 }
+.main.main-prview {
+  max-width: none;
+  padding-inline: clamp(12px, 2vw, 32px);
+}
 
 .muted {
   color: var(--text-dim);
@@ -581,6 +585,9 @@ pre {
 }
 
 /* ── PR view ───────────────────────────────────────────────────────────── */
+.prview {
+  min-width: 0;
+}
 .prview .pr-header {
   position: sticky;
   top: 56px;
@@ -726,6 +733,10 @@ pre {
 }
 
 /* ── Diff file cards (rendered by @pierre/diffs) ───────────────────────── */
+.diff {
+  width: 100%;
+  min-width: 0;
+}
 .diff .file-block {
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
@@ -733,17 +744,17 @@ pre {
   background: var(--bg-elev);
   overflow: hidden;
   box-shadow: var(--shadow);
-  transition:
-    border-color 0.18s ease,
-    box-shadow 0.18s ease;
+  transition: border-color 0.18s ease;
   animation: rise 0.45s cubic-bezier(0.16, 1, 0.3, 1) backwards;
 }
 .diff .file-block:hover {
   border-color: var(--border-strong);
-  box-shadow: var(--shadow-lg);
 }
 
 .pierre-diff {
+  display: block;
+  width: 100%;
+  min-width: 0;
   font-size: 12.5px;
 }
 .pierre-diff [data-diffs-file-header],
@@ -771,15 +782,20 @@ pre {
 
 /* Inline review threads injected at a diff line. */
 .pierre-annotation {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   padding: 10px 16px 12px;
   background: color-mix(in srgb, var(--accent) 6%, var(--bg-inset));
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   box-shadow: inset 2px 0 0 var(--accent);
+  overflow-wrap: anywhere;
 }
 
 /* File-level threads (no specific line) shown above the diff. */
 .file-threads {
+  min-width: 0;
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-inset);
@@ -793,15 +809,16 @@ pre {
 
 /* ── Threads / comments ────────────────────────────────────────────────── */
 .thread {
+  min-width: 0;
+  max-width: 100%;
   border: 1px solid var(--border);
   border-radius: var(--r);
   margin: 8px 0;
   padding: 12px 14px;
   background: var(--bg-elev);
   box-shadow: inset 2px 0 0 var(--border-strong);
-  transition:
-    box-shadow 0.15s ease,
-    border-color 0.15s ease;
+  overflow-wrap: anywhere;
+  transition: border-color 0.15s ease;
 }
 .thread.sev-blocker {
   box-shadow: inset 2px 0 0 var(--blocker);
@@ -831,11 +848,23 @@ pre {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
   margin-bottom: 10px;
+}
+.thread-meta .spacer {
+  min-width: 12px;
+}
+.thread-comments,
+.thread-comments .comment,
+.comment-body {
+  min-width: 0;
+  max-width: 100%;
 }
 .thread-comments .comment {
   padding: 8px 0;
   border-top: 1px solid var(--border-soft);
+  overflow-wrap: anywhere;
 }
 .thread-comments .comment:first-child {
   border-top: none;
@@ -879,6 +908,7 @@ pre {
 }
 .comment-body p {
   margin: 4px 0;
+  overflow-wrap: anywhere;
 }
 .comment-body p:first-child {
   margin-top: 0;
@@ -891,27 +921,39 @@ pre {
   border: 1px solid var(--border-soft);
   padding: 1px 5px;
   border-radius: var(--r-xs);
+  white-space: break-spaces;
+  overflow-wrap: anywhere;
+}
+.comment-body a {
+  overflow-wrap: anywhere;
 }
 .comment-body pre {
   background: var(--bg-inset);
   border: 1px solid var(--border);
   padding: 12px;
   border-radius: var(--r);
-  overflow-x: auto;
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .comment-body pre code {
   border: 0;
   padding: 0;
   background: transparent;
+  white-space: inherit;
 }
 
 .thread-reply {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
   margin-top: 10px;
 }
 .thread-reply textarea {
   flex: 1;
+  min-width: min(220px, 100%);
   background: var(--bg-inset);
   color: var(--text);
   border: 1px solid var(--border);
