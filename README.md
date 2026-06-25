@@ -38,6 +38,7 @@ during iteration, and they can't see beyond the diff. This tool:
 - At least one supported AI CLI on your `PATH`:
   - [Claude Code](https://docs.claude.com/en/docs/claude-code)
   - [Gemini CLI](https://github.com/google-gemini/gemini-cli)
+  - [Codex CLI](https://github.com/openai/codex) — authenticate with `codex login`
 - Local clones of the repositories you want to review
 
 ## Install
@@ -85,6 +86,19 @@ add a `gemini` block to `config.json`:
 ```
 
 Get a key at <https://aistudio.google.com/apikey>. `model` is optional.
+
+### Codex
+
+Codex authenticates on its own — run `codex login` (or set `OPENAI_API_KEY`).
+It runs in a read-only sandbox by default; override the model or sandbox in
+`config.json` if needed:
+
+```json
+{
+  "provider": "codex",
+  "codex": { "model": "gpt-5-codex", "sandbox": "read-only" }
+}
+```
 
 ## Run
 

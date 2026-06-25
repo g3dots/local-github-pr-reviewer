@@ -19,12 +19,22 @@ const GeminiSchema = z
   })
   .optional();
 
+// Codex authenticates via `codex login` / OPENAI_API_KEY (no key needed here).
+// `sandbox` defaults to read-only — enough to investigate the diff.
+const CodexSchema = z
+  .object({
+    model: z.string().min(1).optional(),
+    sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+  })
+  .optional();
+
 const ConfigSchema = z.object({
-  provider: z.enum(["claude", "gemini"]).default("claude"),
+  provider: z.enum(["claude", "gemini", "codex"]).default("claude"),
   port: z.number().int().positive().default(47823),
   host: z.string().default("127.0.0.1"),
   repos: z.array(RepoSchema).default([]),
   gemini: GeminiSchema,
+  codex: CodexSchema,
 });
 
 export type RepoConfig = z.infer<typeof RepoSchema>;

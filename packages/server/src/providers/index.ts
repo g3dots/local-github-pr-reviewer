@@ -1,10 +1,12 @@
 import type { Provider } from "./types.js";
 import { claudeProvider } from "./claude.js";
 import { geminiProvider } from "./gemini.js";
+import { codexProvider } from "./codex.js";
 
 const REGISTRY: Record<string, Provider> = {
   [claudeProvider.id]: claudeProvider,
   [geminiProvider.id]: geminiProvider,
+  [codexProvider.id]: codexProvider,
 };
 
 export function getProvider(id: string): Provider {
