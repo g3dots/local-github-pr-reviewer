@@ -35,3 +35,6 @@ coverage/
 # Tooling caches
 .eslintcache
 *.tsbuildinfo
+
+# Test / coverage artifacts
+.playwright-mcp/

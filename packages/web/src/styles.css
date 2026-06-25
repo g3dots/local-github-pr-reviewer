@@ -901,6 +901,16 @@ pre {
 .thread-meta .spacer {
   min-width: 12px;
 }
+.thread-anchor {
+  color: var(--muted);
+  background: var(--surface-2, rgba(127, 127, 127, 0.12));
+  padding: 1px 6px;
+  border-radius: 4px;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .thread-comments,
 .thread-comments .comment,
 .comment-body {

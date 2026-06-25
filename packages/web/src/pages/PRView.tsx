@@ -7,7 +7,7 @@ import { api, postSse, type PRDetail, type Thread } from "../api.js";
 import { Markdown } from "../components/Markdown.js";
 import { ReviewSettingsPanel } from "../components/ReviewSettingsPanel.js";
 import type { ReviewConfigFields } from "../components/ReviewConfigEditor.js";
-import { splitPatchByFile, type PatchFile } from "../diff.js";
+import { splitPatchByFile, parseUnifiedDiff, type PatchFile } from "../diff.js";
 import { sortFiles, statsForThreads, SEVERITY_RANK, NO_SEVERITY_RANK } from "../fileSort.js";
 import { getTheme, subscribeTheme, type Theme } from "../theme.js";
 import { getPrefs, setPref, subscribePrefs, type ViewMode, type Prefs } from "../prefs.js";
@@ -63,37 +63,69 @@ export function PRView() {
 
   const files = useMemo<PatchFile[]>(() => (diff ? splitPatchByFile(diff) : []), [diff]);
 
-  // Index threads by file (inline = anchored to a line; file-level = no line).
-  const { threadsByFile, inlineByFile, fileLevelByFile, prLevel } = useMemo(() => {
+  // The exact (line:side) positions @pierre/diffs will render per file. An
+  // inline annotation on any other line is silently dropped by the renderer,
+  // so we use this to detect anchors that won't show and re-home them.
+  const renderableLines = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    if (!diff) return map;
+    for (const f of parseUnifiedDiff(diff)) {
+      const keys = new Set<string>();
+      for (const h of f.hunks) {
+        for (const ln of h.lines) {
+          if (ln.newLine != null && (ln.kind === "add" || ln.kind === "context"))
+            keys.add(`${ln.newLine}:additions`);
+          if (ln.oldLine != null && (ln.kind === "del" || ln.kind === "context"))
+            keys.add(`${ln.oldLine}:deletions`);
+        }
+      }
+      map.set(f.newPath, keys);
+    }
+    return map;
+  }, [diff]);
+
+  // Index threads by file. An inline thread renders inline only when its file
+  // is in the diff AND its line is in a rendered hunk; otherwise it falls back
+  // to the file-level block (file present) or the orphan section (file absent),
+  // so a flagged comment is never lost.
+  const { threadsByFile, inlineByFile, fileLevelByFile, prLevel, orphanThreads } = useMemo(() => {
     const threadsByFile = new Map<string, Thread[]>();
     const inlineByFile = new Map<string, Map<string, Thread[]>>();
     const fileLevelByFile = new Map<string, Thread[]>();
     const prLevel: Thread[] = [];
-    if (!detail) return { threadsByFile, inlineByFile, fileLevelByFile, prLevel };
+    const orphanThreads: Thread[] = [];
+    if (!detail) return { threadsByFile, inlineByFile, fileLevelByFile, prLevel, orphanThreads };
+    const inDiff = renderableLines.size > 0 ? renderableLines : null;
     for (const t of detail.threads) {
       if (!t.filePath) {
         prLevel.push(t);
         continue;
       }
+      // File isn't in the diff at all — nowhere to anchor it.
+      if (inDiff && !inDiff.has(t.filePath)) {
+        orphanThreads.push(t);
+        continue;
+      }
       const all = threadsByFile.get(t.filePath) ?? [];
       all.push(t);
       threadsByFile.set(t.filePath, all);
-      if (t.line == null) {
+      const side = t.side === "LEFT" ? "deletions" : "additions";
+      const key = `${t.line}:${side}`;
+      const renderable = t.line != null && (!inDiff || (inDiff.get(t.filePath)?.has(key) ?? true));
+      if (t.line == null || !renderable) {
         const arr = fileLevelByFile.get(t.filePath) ?? [];
         arr.push(t);
         fileLevelByFile.set(t.filePath, arr);
         continue;
       }
-      const side = t.side === "LEFT" ? "deletions" : "additions";
       const byLine = inlineByFile.get(t.filePath) ?? new Map<string, Thread[]>();
-      const key = `${t.line}:${side}`;
       const arr = byLine.get(key) ?? [];
       arr.push(t);
       byLine.set(key, arr);
       inlineByFile.set(t.filePath, byLine);
     }
-    return { threadsByFile, inlineByFile, fileLevelByFile, prLevel };
-  }, [detail]);
+    return { threadsByFile, inlineByFile, fileLevelByFile, prLevel, orphanThreads };
+  }, [detail, renderableLines]);
 
   const annByFile = useMemo(() => {
     const out = new Map<string, LineThreads[]>();
@@ -381,6 +413,25 @@ export function PRView() {
               <h3>PR-level threads</h3>
               {prLevel.map((t) => (
                 <ThreadCard key={t.id} thread={t} repoId={detail.repo.id} onChange={load} />
+              ))}
+            </section>
+          )}
+
+          {orphanThreads.length > 0 && (
+            <section className="pr-level-threads">
+              <h3>Comments outside the diff</h3>
+              <p className="muted small">
+                These reference files or lines not present in this diff, so they can't be anchored
+                inline.
+              </p>
+              {orphanThreads.map((t) => (
+                <ThreadCard
+                  key={t.id}
+                  thread={t}
+                  repoId={detail.repo.id}
+                  onChange={load}
+                  showAnchor
+                />
               ))}
             </section>
           )}
@@ -752,7 +803,13 @@ function FileBlock({
       {fileThreads.length > 0 && !collapsed && (
         <div className="file-threads">
           {fileThreads.map((t) => (
-            <ThreadCard key={t.id} thread={t} repoId={repoId} onChange={onChange} />
+            <ThreadCard
+              key={t.id}
+              thread={t}
+              repoId={repoId}
+              onChange={onChange}
+              showAnchor={t.line != null}
+            />
           ))}
         </div>
       )}
@@ -790,11 +847,13 @@ function ThreadCard({
   repoId,
   onChange,
   compact = false,
+  showAnchor = false,
 }: {
   thread: Thread;
   repoId: number;
   onChange: () => void;
   compact?: boolean;
+  showAnchor?: boolean;
 }) {
   const [reply, setReply] = useState("");
   const [streaming, setStreaming] = useState<null | "reply" | "revalidate">(null);
@@ -831,6 +890,12 @@ function ThreadCard({
     <div className={`thread ${sevClass} ${thread.status} ${compact ? "compact" : ""}`}>
       <div className="thread-meta">
         {thread.severity && <span className={`pill sev ${sevClass}`}>{thread.severity}</span>}
+        {showAnchor && thread.filePath && (
+          <span className="thread-anchor mono small" title={thread.filePath}>
+            {thread.filePath.split("/").pop()}
+            {thread.line != null ? `:${thread.line}` : ""}
+          </span>
+        )}
         {thread.stale && <span className="pill warn">stale</span>}
         {thread.status === "resolved" && <span className="pill ok">resolved</span>}
         <div className="spacer" />

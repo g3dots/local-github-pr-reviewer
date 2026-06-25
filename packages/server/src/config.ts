@@ -9,11 +9,22 @@ const RepoSchema = z.object({
   localPath: z.string().min(1),
 });
 
+// Gemini's personal-account OAuth (Code Assist for individuals) is being
+// retired, so the CLI fails with IneligibleTierError. Supplying an API key
+// makes the CLI authenticate via the Gemini API instead.
+const GeminiSchema = z
+  .object({
+    apiKey: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+  })
+  .optional();
+
 const ConfigSchema = z.object({
   provider: z.enum(["claude", "gemini"]).default("claude"),
   port: z.number().int().positive().default(47823),
   host: z.string().default("127.0.0.1"),
   repos: z.array(RepoSchema).default([]),
+  gemini: GeminiSchema,
 });
 
 export type RepoConfig = z.infer<typeof RepoSchema>;

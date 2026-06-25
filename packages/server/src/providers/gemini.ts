@@ -8,6 +8,7 @@ import type {
 import { buildReviewPrompt, buildReplyPrompt, buildRevalidatePrompt } from "./prompt.js";
 import { parseReviewOutput, parseRevalidateOutput } from "./parser.js";
 import { spawnCli, commandExists } from "./spawn.js";
+import { loadConfig } from "../config.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readdir, readFile, writeFile, rm } from "node:fs/promises";
@@ -33,6 +34,27 @@ interface GeminiJsonResult {
 }
 
 const geminiTmpDir = (): string => join(homedir(), ".gemini", "tmp");
+
+/** An API key from config or the environment lets the CLI skip the retired
+ *  personal-account OAuth flow that now fails with IneligibleTierError. */
+function geminiApiKey(): string | undefined {
+  return (
+    loadConfig().gemini?.apiKey?.trim() ||
+    process.env.GEMINI_API_KEY?.trim() ||
+    process.env.GOOGLE_API_KEY?.trim() ||
+    undefined
+  );
+}
+
+function isAuthError(text: string): boolean {
+  return /IneligibleTierError|Error authenticating|no longer supported|GEMINI_API_KEY/i.test(text);
+}
+
+const AUTH_HELP =
+  "Gemini CLI authentication failed. Personal-account login (Code Assist for " +
+  'individuals) is being retired by Google. Add a `"gemini": { "apiKey": "…" }` ' +
+  "block to config.json (or set GEMINI_API_KEY) — get a key at " +
+  "https://aistudio.google.com/apikey.";
 
 /** The project tmp dir for `cwd`, resolved via Gemini's own cwd→label map. */
 async function geminiProjectDirForCwd(cwd: string): Promise<string | null> {
@@ -65,15 +87,21 @@ async function runGemini(
   onProgress?: ProviderProgress,
 ): Promise<GeminiRun> {
   onProgress?.({ type: "log", data: `[gemini] running in ${cwd}\n` });
-  const args = ["--approval-mode", "yolo", "--output-format", "json", "-p", prompt];
+  const cfg = loadConfig().gemini;
+  const apiKey = geminiApiKey();
+  const args = ["--approval-mode", "yolo", "--output-format", "json"];
+  if (cfg?.model) args.push("-m", cfg.model);
+  args.push("-p", prompt);
   const res = await spawnCli({
     cmd: "gemini",
     args,
     cwd,
+    env: apiKey ? { GEMINI_API_KEY: apiKey } : undefined,
     onProgress,
     timeoutMs: 15 * 60 * 1000,
   });
   if (res.exitCode !== 0) {
+    if (isAuthError(res.stderr)) throw new Error(AUTH_HELP);
     throw new Error(`gemini exited ${res.exitCode}: ${res.stderr.slice(0, 500)}`);
   }
   let parsed: GeminiJsonResult | null = null;
@@ -85,6 +113,7 @@ async function runGemini(
   if (parsed) {
     if (parsed.error) {
       const msg = typeof parsed.error === "string" ? parsed.error : parsed.error.message;
+      if (msg && isAuthError(msg)) throw new Error(AUTH_HELP);
       throw new Error(msg || "gemini reported an error");
     }
     return {

@@ -70,6 +70,22 @@ You can also add and remove repos at runtime from the **Settings** page —
 paste a local path, the server runs `gh repo view` inside it, and the
 GitHub owner/name is auto-detected.
 
+### Gemini authentication
+
+Google is retiring personal-account login for the Gemini CLI (`Code Assist
+for individuals`), so reviews fail with `IneligibleTierError`. Authenticate
+with an API key instead — either set `GEMINI_API_KEY` in the environment, or
+add a `gemini` block to `config.json`:
+
+```json
+{
+  "provider": "gemini",
+  "gemini": { "apiKey": "YOUR_KEY", "model": "gemini-2.5-pro" }
+}
+```
+
+Get a key at <https://aistudio.google.com/apikey>. `model` is optional.
+
 ## Run
 
 ```bash
