@@ -9,6 +9,49 @@ import {
 import { z } from "zod";
 import * as api from "@reviewer/server/api";
 
+let nextJobId = 1;
+interface Job {
+  id: number;
+  status: "running" | "completed" | "error";
+  result?: unknown;
+  error?: string;
+  type: string;
+}
+const jobs = new Map<number, Job>();
+const MAX_JOBS = 100;
+
+function launchJob(type: string, promise: Promise<unknown>) {
+  const jobId = nextJobId++;
+  jobs.set(jobId, { id: jobId, status: "running", type });
+
+  if (jobs.size > MAX_JOBS) {
+    const oldestKeys = Array.from(jobs.keys()).slice(0, jobs.size - MAX_JOBS);
+    for (const key of oldestKeys) {
+      jobs.delete(key);
+    }
+  }
+
+  promise
+    .then((result) => {
+      const job = jobs.get(jobId);
+      if (job) {
+        job.status = "completed";
+        job.result = result;
+      }
+    })
+    .catch((error) => {
+      const job = jobs.get(jobId);
+      if (job) {
+        job.status = "error";
+        job.error = String(error);
+      }
+    });
+
+  return {
+    content: [{ type: "text", text: JSON.stringify({ jobId, status: "running" }, null, 2) }],
+  };
+}
+
 const server = new Server(
   {
     name: "reviewer-mcp",
@@ -146,6 +189,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             pathExclude: { type: "string" },
           },
           required: ["prId"],
+        },
+      },
+      {
+        name: "apply_preset",
+        description: "Applies a specific review preset to a PR by its ID.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            prId: { type: "number" },
+            presetId: { type: "number" },
+          },
+          required: ["prId", "presetId"],
+        },
+      },
+      {
+        name: "get_job_status",
+        description:
+          "Checks the status of an asynchronous background job (like a review or revalidation).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            jobId: { type: "number" },
+          },
+          required: ["jobId"],
         },
       },
       {
@@ -378,14 +445,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ],
         };
       }
+      case "apply_preset": {
+        const { prId, presetId } = z
+          .object({ prId: z.number(), presetId: z.number() })
+          .parse(request.params.arguments);
+        requirePr(prId);
+        const preset = api.listPresets().find((p) => p.id === presetId);
+        if (!preset) throw new McpError(ErrorCode.InvalidParams, `Preset ${presetId} not found`);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                api.setPrReviewConfig(prId, {
+                  categories: preset.categories,
+                  strictness: preset.strictness,
+                  customRules: preset.customRules,
+                }),
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+      case "get_job_status": {
+        const { jobId } = z.object({ jobId: z.number() }).parse(request.params.arguments);
+        const job = jobs.get(jobId);
+        if (!job) throw new McpError(ErrorCode.InvalidParams, `Job ${jobId} not found`);
+        return { content: [{ type: "text", text: JSON.stringify(job, null, 2) }] };
+      }
       case "trigger_review": {
         const { prId } = z.object({ prId: z.number() }).parse(request.params.arguments);
         const pr = requirePr(prId);
         const repo = requireRepo(pr.repo_id);
         const providerId = api.getSettings().provider;
 
-        const result = await api.runReview({ repo, pr, providerId });
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        return launchJob("review", api.runReview({ repo, pr, providerId }));
       }
       case "reply_to_thread": {
         const { threadId, message } = z
@@ -399,8 +495,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const repo = requireRepo(pr.repo_id);
         const providerId = api.getSettings().provider;
 
-        const result = await api.runReply({ repo, pr, threadId, userMessage: message, providerId });
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        return launchJob(
+          "reply",
+          api.runReply({ repo, pr, threadId, userMessage: message, providerId }),
+        );
       }
       case "revalidate_thread": {
         const { threadId } = z.object({ threadId: z.number() }).parse(request.params.arguments);
@@ -412,8 +510,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const repo = requireRepo(pr.repo_id);
         const providerId = api.getSettings().provider;
 
-        const result = await api.runRevalidate({ repo, pr, threadId, providerId });
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        return launchJob("revalidate", api.runRevalidate({ repo, pr, threadId, providerId }));
       }
       case "set_thread_status": {
         const { threadId, status } = z
