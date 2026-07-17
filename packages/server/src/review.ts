@@ -24,6 +24,24 @@ function now(): string {
   return new Date().toISOString();
 }
 
+const REVIEW_HEARTBEAT_MS = 5_000;
+const REVIEW_STALE_AFTER_MS = 30_000;
+
+export function reconcileInterruptedReviews(): number {
+  const finishedAt = now();
+  const staleBefore = new Date(Date.now() - REVIEW_STALE_AFTER_MS).toISOString();
+  return getDb()
+    .prepare(
+      `
+      UPDATE reviews
+      SET status = 'error', finished_at = ?, error = 'Review interrupted before completion.'
+      WHERE status = 'running'
+        AND (heartbeat_at IS NULL OR heartbeat_at < ?)
+    `,
+    )
+    .run(finishedAt, staleBefore).changes;
+}
+
 function fingerprint(path: string | null, line: number | null, body: string): string {
   const head = body.replace(/\s+/g, " ").trim().slice(0, 200);
   return `${path ?? ""}|${line ?? ""}|${head}`;
@@ -43,48 +61,53 @@ export async function runReview(
   const provider = getProvider(providerId);
   const db = getDb();
 
-  // Refresh PR detail + diff
-  const refreshed = await hydratePR(repo, pr.number);
-  const diff = await gh.getPRDiff(repo.owner, repo.name, pr.number);
-
-  const skills = getSkills(repo.id);
-  const prConfig = getPrReviewConfig(refreshed.id);
-  const globalConfig = getGlobalReviewConfig();
-
-  const existingOpen = db
-    .prepare(
-      `
-    SELECT t.*, c.body AS first_body
-    FROM threads t
-    LEFT JOIN comments c ON c.id = (SELECT id FROM comments WHERE thread_id = t.id ORDER BY id ASC LIMIT 1)
-    WHERE t.pr_id = ? AND t.status = 'open'
-  `,
-    )
-    .all(refreshed.id) as (ThreadRow & { first_body: string | null })[];
-
-  // Mark threads on a different head_sha as stale (not resolved — user-only resolves)
-  let staleMarked = 0;
-  if (existingOpen.length > 0) {
-    const stmt = db.prepare("UPDATE threads SET stale = 1 WHERE id = ? AND last_seen_sha != ?");
-    for (const t of existingOpen) {
-      const r = stmt.run(t.id, refreshed.head_sha);
-      staleMarked += r.changes;
-    }
-  }
-
   const reviewInsert = db.prepare(`
-    INSERT INTO reviews (pr_id, head_sha, provider, status, started_at)
-    VALUES (?, ?, ?, 'running', ?)
+    INSERT INTO reviews (pr_id, head_sha, provider, status, started_at, heartbeat_at)
+    VALUES (?, ?, ?, 'running', ?, ?)
   `);
+  const startedAt = now();
   const reviewId = Number(
-    reviewInsert.run(refreshed.id, refreshed.head_sha, providerId, now()).lastInsertRowid,
+    reviewInsert.run(pr.id, pr.head_sha, providerId, startedAt, startedAt).lastInsertRowid,
   );
+  const heartbeat = db.prepare(
+    "UPDATE reviews SET heartbeat_at = ? WHERE id = ? AND status = 'running'",
+  );
+  const heartbeatTimer = setInterval(() => heartbeat.run(now(), reviewId), REVIEW_HEARTBEAT_MS);
 
   const reviewFinish = db.prepare(`
     UPDATE reviews SET status = ?, summary = ?, finished_at = ?, error = ? WHERE id = ?
   `);
 
   try {
+    const refreshed = await hydratePR(repo, pr.number);
+    db.prepare("UPDATE reviews SET head_sha = ? WHERE id = ?").run(refreshed.head_sha, reviewId);
+    const diff = await gh.getPRDiff(repo.owner, repo.name, pr.number);
+
+    const skills = getSkills(repo.id);
+    const prConfig = getPrReviewConfig(refreshed.id);
+    const globalConfig = getGlobalReviewConfig();
+
+    const existingOpen = db
+      .prepare(
+        `
+      SELECT t.*, c.body AS first_body
+      FROM threads t
+      LEFT JOIN comments c ON c.id = (SELECT id FROM comments WHERE thread_id = t.id ORDER BY id ASC LIMIT 1)
+      WHERE t.pr_id = ? AND t.status = 'open'
+    `,
+      )
+      .all(refreshed.id) as (ThreadRow & { first_body: string | null })[];
+
+    // Mark threads on a different head_sha as stale (not resolved — user-only resolves)
+    let staleMarked = 0;
+    if (existingOpen.length > 0) {
+      const stmt = db.prepare("UPDATE threads SET stale = 1 WHERE id = ? AND last_seen_sha != ?");
+      for (const t of existingOpen) {
+        const r = stmt.run(t.id, refreshed.head_sha);
+        staleMarked += r.changes;
+      }
+    }
+
     const wt = await preparePrHeadWorktree({ repo, pr: refreshed, onProgress });
     try {
       const ctx: ReviewContext = {
@@ -161,6 +184,8 @@ export async function runReview(
   } catch (e) {
     reviewFinish.run("error", null, now(), (e as Error).message, reviewId);
     throw e;
+  } finally {
+    clearInterval(heartbeatTimer);
   }
 }
 

@@ -35,7 +35,13 @@ import {
 } from "./reviewConfig.js";
 import { catalogForClient } from "./reviewCatalog.js";
 import { buildReviewInstructions } from "./providers/prompt.js";
-import { runReview, runReply, runRevalidate, setThreadStatus } from "./review.js";
+import {
+  runReview,
+  runReply,
+  runRevalidate,
+  setThreadStatus,
+  reconcileInterruptedReviews,
+} from "./review.js";
 import * as gh from "./github.js";
 import { listProviderStatus, getProvider } from "./providers/index.js";
 import { getSettings, setProvider } from "./settings.js";
@@ -266,6 +272,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     const repo = requireRepo(pr.repo_id);
     const refreshed = await hydratePR(repo, pr.number);
     const threads = listThreadsForPR(refreshed.id);
+    reconcileInterruptedReviews();
     const lastReviewRow = getDb()
       .prepare("SELECT * FROM reviews WHERE pr_id = ? ORDER BY id DESC LIMIT 1")
       .get(refreshed.id) as
@@ -368,6 +375,38 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     const diff = await gh.getPRDiff(repo.owner, repo.name, pr.number);
     reply.header("content-type", "text/plain; charset=utf-8");
     return diff;
+  });
+
+  app.get("/api/prs/:prId/review/status", async (req) => {
+    const { prId } = z.object({ prId: z.coerce.number() }).parse(req.params);
+    if (!getPRById(prId)) throw new Error(`pr ${prId} not found`);
+    reconcileInterruptedReviews();
+    const row = getDb()
+      .prepare("SELECT * FROM reviews WHERE pr_id = ? ORDER BY id DESC LIMIT 1")
+      .get(prId) as
+      | {
+          id: number;
+          head_sha: string;
+          provider: string;
+          status: string;
+          summary: string | null;
+          started_at: string;
+          finished_at: string | null;
+          error: string | null;
+        }
+      | undefined;
+    return row
+      ? {
+          id: row.id,
+          headSha: row.head_sha,
+          provider: row.provider,
+          status: row.status,
+          summary: row.summary,
+          startedAt: row.started_at,
+          finishedAt: row.finished_at,
+          error: row.error,
+        }
+      : null;
   });
 
   app.get("/api/prs/:prId/files", async (req) => {
