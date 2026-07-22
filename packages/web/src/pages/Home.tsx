@@ -94,8 +94,7 @@ export function Home() {
                 key={p.id}
                 className={`pill ${p.available ? "ok" : "warn"} ${status.settings.provider === p.id ? "active" : ""}`}
               >
-                {p.displayName}
-                {p.available ? "" : " (missing)"}
+                {p.displayName}: {p.available ? "found" : "missing"}
               </span>
             ))}
           </div>
