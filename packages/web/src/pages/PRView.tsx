@@ -41,6 +41,7 @@ export function PRView() {
   const { prId } = useParams();
   const id = Number(prId);
   const [detail, setDetail] = useState<PRDetail | null>(null);
+  const [savingProvider, setSavingProvider] = useState(false);
   const [diff, setDiff] = useState<string>("");
   const [stream, setStream] = useState<StreamState>({
     active: false,
@@ -320,6 +321,19 @@ export function PRView() {
     }
   }, [id, load]);
 
+  const switchReviewerProvider = useCallback(
+    async (provider: string | null) => {
+      setSavingProvider(true);
+      try {
+        const reviewerProvider = await api.setPrReviewerProvider(id, provider);
+        setDetail((current) => (current ? { ...current, reviewerProvider } : current));
+      } finally {
+        setSavingProvider(false);
+      }
+    },
+    [id],
+  );
+
   if (!detail) return <div className="loading">Loading…</div>;
 
   const resolved = detail.threads.filter((t) => t.status === "resolved");
@@ -383,6 +397,31 @@ export function PRView() {
             Split
           </button>
         </div>
+        <label className="pr-provider-picker">
+          <span className="muted small">Reviewer</span>
+          <select
+            className="reviewer-provider-select"
+            value={detail.reviewerProvider.override ?? ""}
+            disabled={reviewActive || savingProvider}
+            onChange={(e) => void switchReviewerProvider(e.target.value || null)}
+          >
+            <option value="">
+              Use {detail.reviewerProvider.repoOverride ? "repo" : "global"} default (
+              {detail.reviewerProviders.find(
+                (p) =>
+                  p.id === (detail.reviewerProvider.repoOverride ?? detail.reviewerProvider.global),
+              )?.displayName ??
+                detail.reviewerProvider.repoOverride ??
+                detail.reviewerProvider.global}
+              )
+            </option>
+            {detail.reviewerProviders.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.displayName}
+              </option>
+            ))}
+          </select>
+        </label>
         {detail.threads.length > 0 && (
           <button className="btn" onClick={clearReview} disabled={reviewActive}>
             Clear review
