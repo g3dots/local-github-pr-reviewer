@@ -70,7 +70,18 @@ async function runCodex(
 ): Promise<CodexRun> {
   onProgress?.({ type: "log", data: `[codex] running in ${cwd}\n` });
   const cfg = loadConfig().codex;
-  const args = ["exec", "--json", "--skip-git-repo-check", "-C", cwd];
+  // Reviewer does not use Codex's interactive model picker. Disable remote
+  // catalog refreshes so concurrent/newer Codex installations cannot leave a
+  // shared models_cache.json that this CLI version cannot deserialize.
+  const args = [
+    "exec",
+    "--json",
+    "-c",
+    "features.remote_models=false",
+    "--skip-git-repo-check",
+    "-C",
+    cwd,
+  ];
   args.push("-s", cfg?.sandbox ?? "read-only");
   if (cfg?.model) args.push("-m", cfg.model);
   const res = await spawnCli({

@@ -61,3 +61,34 @@ describe("codexProvider failures", () => {
     );
   });
 });
+
+describe("codexProvider invocation", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.loadConfig.mockReturnValue({ codex: undefined });
+  });
+
+  it("disables the shared remote models cache for non-interactive reviews", async () => {
+    mocks.spawnCli.mockResolvedValue({
+      exitCode: 0,
+      stderr: "",
+      stdout: `${JSON.stringify({ type: "thread.started", thread_id: "session-123" })}\n${JSON.stringify(
+        {
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: '```json\n{"summary":"Looks good.","comments":[]}\n```',
+          },
+        },
+      )}\n`,
+      combinedOutput: "",
+    });
+
+    await codexProvider.review(reviewContext());
+
+    expect(mocks.spawnCli).toHaveBeenCalledOnce();
+    expect(mocks.spawnCli.mock.calls[0]?.[0].args).toEqual(
+      expect.arrayContaining(["-c", "features.remote_models=false"]),
+    );
+  });
+});
