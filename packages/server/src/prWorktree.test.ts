@@ -47,6 +47,7 @@ describe("preparePrHeadWorktree", () => {
       let out = "";
 
       if (args[0] === "fetch") out = "";
+      else if (args[0] === "for-each-ref") out = responses["for-each-ref"] || "";
       else if (args[0] === "rev-parse" && args[1] !== "HEAD") {
         out = responses["rev-parse ref"] || "correct_sha";
       } else if (args[0] === "rev-parse" && args[1] === "HEAD") {
@@ -77,7 +78,14 @@ describe("preparePrHeadWorktree", () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       "git",
-      ["fetch", "--no-tags", "origin", "+refs/pull/42/head:refs/reviewer/pr/1/42"],
+      [
+        "fetch",
+        "--no-tags",
+        "origin",
+        expect.stringMatching(
+          /^\+refs\/pull\/42\/head:refs\/reviewer\/actions\/1-42-\d+-[0-9a-f]{8}$/,
+        ),
+      ],
       expect.any(Object),
     );
 
@@ -93,6 +101,15 @@ describe("preparePrHeadWorktree", () => {
       ["worktree", "remove", "--force", wt.cwd],
       expect.any(Object),
     );
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "git",
+      [
+        "update-ref",
+        "-d",
+        expect.stringMatching(/^refs\/reviewer\/actions\/1-42-\d+-[0-9a-f]{8}$/),
+      ],
+      expect.any(Object),
+    );
   });
 
   it("fails if fetched SHA mismatches", async () => {
@@ -104,6 +121,33 @@ describe("preparePrHeadWorktree", () => {
     const pr = { number: 42, head_sha: "test_sha" };
 
     await expect(preparePrHeadWorktree({ repo, pr })).rejects.toThrow(/does not match/);
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "git",
+      [
+        "update-ref",
+        "-d",
+        expect.stringMatching(/^refs\/reviewer\/actions\/1-42-\d+-[0-9a-f]{8}$/),
+      ],
+      expect.any(Object),
+    );
+  });
+
+  it("uses distinct refs for concurrent actions on the same PR", async () => {
+    setupGitMock({ "rev-parse ref": "test_sha" });
+    const repo = { id: 1, owner: "o", name: "n", local_path: "/local" } as any;
+    const pr = { number: 42, head_sha: "test_sha" };
+
+    const worktrees = await Promise.all([
+      preparePrHeadWorktree({ repo, pr }),
+      preparePrHeadWorktree({ repo, pr }),
+    ]);
+    const fetchRefs = mockSpawn.mock.calls
+      .filter(([, args]: [string, string[]]) => args[0] === "fetch")
+      .map(([, args]: [string, string[]]) => args[3]);
+
+    expect(new Set(fetchRefs).size).toBe(2);
+    expect(worktrees[0].cwd).not.toBe(worktrees[1].cwd);
+    await Promise.all(worktrees.map((worktree) => worktree.cleanup()));
   });
 
   it("terminates cleanup that exceeds its time budget", async () => {
@@ -119,7 +163,9 @@ describe("preparePrHeadWorktree", () => {
       ee.kill = vi.fn();
       ee.pid = 999_999_000 + invocation;
 
-      if (invocation < 4) {
+      if (args[0] === "update-ref") {
+        queueMicrotask(() => ee.emit("close", 0));
+      } else if (invocation < 4) {
         const out = args[0] === "rev-parse" ? "test_sha" : "";
         queueMicrotask(() => {
           ee.stdout.emit("data", Buffer.from(out));
@@ -142,6 +188,11 @@ describe("preparePrHeadWorktree", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     await cleanup;
     expect(cleanupChild.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "git",
+      ["update-ref", "-d", expect.stringMatching(/^refs\/reviewer\/actions\//)],
+      expect.any(Object),
+    );
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("timed out after 30000ms"));
     cleanupChild.emit("close", null);
     errorSpy.mockRestore();
@@ -188,6 +239,24 @@ describe("preparePrHeadWorktree", () => {
     expect(mockSpawn).not.toHaveBeenCalledWith(
       "git",
       ["worktree", "remove", "--force", "/data/worktrees/repo-1/active-review"],
+      expect.any(Object),
+    );
+  });
+
+  it("sweeps only action refs older than the lifecycle safety window", async () => {
+    const oldTimestamp = Date.now() - 60_000;
+    const activeTimestamp = Date.now();
+    const oldRef = `refs/reviewer/actions/1-42-${oldTimestamp}-aaaaaaaa`;
+    const activeRef = `refs/reviewer/actions/1-42-${activeTimestamp}-bbbbbbbb`;
+    setupGitMock({ "for-each-ref": `${oldRef}\n${activeRef}` });
+    const repo = { id: 1, local_path: "/local" } as any;
+
+    await pruneStaleWorktrees([repo], 30_000);
+
+    expect(mockSpawn).toHaveBeenCalledWith("git", ["update-ref", "-d", oldRef], expect.any(Object));
+    expect(mockSpawn).not.toHaveBeenCalledWith(
+      "git",
+      ["update-ref", "-d", activeRef],
       expect.any(Object),
     );
   });

@@ -11,23 +11,20 @@ import * as api from "@reviewer/server/api";
 import { resolveJobStatus, type Job } from "./jobStatus.js";
 import { collectViewerPrs } from "./prDiscovery.js";
 import { handleAwaitReview } from "./awaitReview.js";
+import { handleAwaitThreadAction } from "./awaitThreadAction.js";
+import { resolveThreadActionStatus, selectThreadAction } from "./threadActionStatus.js";
 
-// Ephemeral reply/revalidate jobs use negative IDs; positive review job IDs
-// are their durable SQLite review IDs and survive MCP process restarts.
-let nextJobId = -1;
+// Review job IDs are their durable SQLite review IDs. The in-memory cache is
+// retained only for legacy get_job_status callers; canonical waits read SQLite.
 const jobs = new Map<number, Job>();
 const MAX_JOBS = 100;
 
-function launchJob(
-  type: string,
-  promise: Promise<unknown>,
-  metadata: Pick<Job, "reviewId" | "prId"> = {},
-) {
-  const jobId = metadata.reviewId ?? nextJobId--;
+function launchJob(promise: Promise<unknown>, metadata: { reviewId: number; prId?: number }) {
+  const jobId = metadata.reviewId;
   const job: Job = {
     id: jobId,
     status: "running",
-    type,
+    type: "review",
     startedAt: new Date().toISOString(),
     ...metadata,
   };
@@ -77,17 +74,43 @@ function launchJob(
   };
 }
 
+function threadActionLaunchResponse(started: api.StartedThreadAction<unknown>) {
+  void started.completion.catch(() => {
+    // Durable action state records the failure for await/recovery callers.
+  });
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            actionId: started.actionId,
+            type: started.kind,
+            status: "running",
+            created: started.created,
+            joined: !started.created,
+            nextAction:
+              "Call await_thread_action once with this actionId. Do not poll or start another action on this thread.",
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
+
 const server = new Server(
   {
     name: "reviewer-mcp",
-    version: "0.4.1",
+    version: "0.4.2",
   },
   {
     capabilities: {
       tools: {},
     },
     instructions:
-      "Review lifecycle: call trigger_review once, then call await_review exactly once with the returned reviewId. Never poll get_job_status, create timers/watchers, or re-trigger an active review. trigger_review is idempotent across every Reviewer process, and await_review returns the committed threads as soon as they exist.",
+      "All review state and threads are local, not GitHub comments. Review lifecycle: call trigger_review once, then await_review once with its durable reviewId. Thread lifecycle: call reply_to_thread or revalidate_thread once, then await_thread_action once with its durable actionId. Never poll, create timers/watchers, or duplicate active work. Treat AI findings as advisory; patch, dismiss, revalidate, or resolve each thread deliberately before a new full review.",
   },
 );
 
@@ -309,7 +332,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "get_job_status",
         description:
-          "Legacy non-blocking snapshot for an asynchronous job. Do not poll review jobs with this tool; call await_review once with the explicit reviewId instead. Only reviewId is guaranteed to survive MCP restarts; an uncached jobId is rejected to avoid confusing pre-0.4.1 job counters with unrelated reviews.",
+          "Legacy non-blocking snapshot for a full review. Do not poll with this tool; call await_review once with the explicit durable reviewId instead.",
         inputSchema: {
           type: "object",
           properties: {
@@ -356,7 +379,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "reply_to_thread",
-        description: "Submits a reply message to a specific review thread.",
+        description:
+          "Idempotently starts or joins a durable local AI reply action for a review thread and returns its actionId immediately. Then call await_thread_action once; nothing is posted to GitHub.",
         inputSchema: {
           type: "object",
           properties: {
@@ -369,13 +393,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "revalidate_thread",
         description:
-          "Triggers an AI re-check of an open thread to see if recent commits resolved it.",
+          "Idempotently starts or joins a durable local AI revalidation action for a thread and returns its actionId immediately. Then call await_thread_action once.",
         inputSchema: {
           type: "object",
           properties: {
             threadId: { type: "number" },
           },
           required: ["threadId"],
+        },
+      },
+      {
+        name: "get_thread_action",
+        description:
+          "Returns one persisted thread-action snapshot immediately. Use actionId normally, or threadId once to recover the latest action after a lost response; do not poll it.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            actionId: { type: "number" },
+            threadId: { type: "number" },
+          },
+          anyOf: [{ required: ["actionId"] }, { required: ["threadId"] }],
+        },
+      },
+      {
+        name: "await_thread_action",
+        description:
+          "Waits once for a durable reply or revalidation action and returns its committed result immediately on completion. Do not poll, create timers, or start another action on the thread.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            actionId: {
+              type: "number",
+              description:
+                "The durable positive ID returned by reply_to_thread or revalidate_thread",
+            },
+            timeoutMs: {
+              type: "number",
+              minimum: 1000,
+              maximum: 1260000,
+              description:
+                "Maximum time for this wait call. Defaults to 21 minutes, one minute beyond the enforced action lifecycle.",
+            },
+          },
+          required: ["actionId"],
         },
       },
       {
@@ -814,7 +874,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
                 })
             : undefined,
         });
-        const launched = launchJob("review", started.completion, {
+        const launched = launchJob(started.completion, {
           reviewId: started.reviewId,
           prId,
         });
@@ -828,7 +888,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       }
       case "reply_to_thread": {
         const { threadId, message } = z
-          .object({ threadId: z.number(), message: z.string() })
+          .object({ threadId: z.number(), message: z.string().min(1) })
           .parse(request.params.arguments);
         const row = api.getDb().prepare("SELECT pr_id FROM threads WHERE id = ?").get(threadId) as
           | { pr_id: number }
@@ -837,11 +897,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         const pr = requirePr(row.pr_id);
         const repo = requireRepo(pr.repo_id);
         const providerId = api.resolveReviewerProvider(repo, pr).provider;
-
-        return launchJob(
-          "reply",
-          api.runReply({ repo, pr, threadId, userMessage: message, providerId }),
-        );
+        const started = api.startReply({ repo, pr, threadId, userMessage: message, providerId });
+        return threadActionLaunchResponse(started);
       }
       case "revalidate_thread": {
         const { threadId } = z.object({ threadId: z.number() }).parse(request.params.arguments);
@@ -852,8 +909,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
         const pr = requirePr(row.pr_id);
         const repo = requireRepo(pr.repo_id);
         const providerId = api.resolveReviewerProvider(repo, pr).provider;
-
-        return launchJob("revalidate", api.runRevalidate({ repo, pr, threadId, providerId }));
+        const started = api.startRevalidate({ repo, pr, threadId, providerId });
+        return threadActionLaunchResponse(started);
+      }
+      case "get_thread_action": {
+        const { actionId, threadId } = z
+          .object({
+            actionId: z.number().int().positive().optional(),
+            threadId: z.number().int().positive().optional(),
+          })
+          .refine((value) => value.actionId !== undefined || value.threadId !== undefined, {
+            message: "actionId or threadId is required",
+          })
+          .parse(request.params.arguments);
+        api.reconcileInterruptedThreadActions();
+        let action;
+        try {
+          action = selectThreadAction(
+            { actionId, threadId },
+            {
+              getById: api.getThreadAction,
+              getLatestForThread: api.getLatestThreadActionForThread,
+            },
+          );
+        } catch (error) {
+          throw new McpError(ErrorCode.InvalidParams, (error as Error).message);
+        }
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(resolveThreadActionStatus(action), null, 2) },
+          ],
+        };
+      }
+      case "await_thread_action": {
+        const { actionId, timeoutMs } = z
+          .object({
+            actionId: z.number().int().positive(),
+            timeoutMs: z
+              .number()
+              .int()
+              .min(1_000)
+              .max(21 * 60 * 1_000)
+              .default(21 * 60 * 1_000),
+          })
+          .parse(request.params.arguments);
+        const resolved = await handleAwaitThreadAction(
+          { actionId, timeoutMs },
+          {
+            signal: extra.signal,
+            progressToken: request.params._meta?.progressToken,
+            sendProgress: (params) =>
+              extra.sendNotification({ method: "notifications/progress", params }),
+          },
+          { waitForThreadAction: api.waitForThreadAction },
+        );
+        return { content: [{ type: "text", text: JSON.stringify(resolved, null, 2) }] };
       }
       case "set_thread_status": {
         const { threadId, status } = z

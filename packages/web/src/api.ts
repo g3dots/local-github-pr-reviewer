@@ -285,6 +285,19 @@ export interface SseEvent {
   data: unknown;
 }
 
+export function errorHasPersistedInput(error: unknown): boolean {
+  const data =
+    error instanceof Error && "data" in error
+      ? (error as Error & { data?: unknown }).data
+      : undefined;
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "inputPersisted" in data &&
+    data.inputPersisted === true
+  );
+}
+
 export async function postSse(
   url: string,
   body: unknown,
@@ -317,11 +330,22 @@ export async function postSse(
         else if (line.startsWith("data:")) dataParts.push(line.slice(5).trim());
       }
       if (dataParts.length === 0) continue;
+      const rawData = dataParts.join("\n");
+      let data: unknown;
       try {
-        const data = JSON.parse(dataParts.join("\n"));
-        onEvent({ event: ev, data });
+        data = JSON.parse(rawData);
       } catch {
-        onEvent({ event: ev, data: dataParts.join("\n") });
+        data = rawData;
+      }
+      onEvent({ event: ev, data });
+      if (ev === "error") {
+        const message =
+          typeof data === "object" && data !== null && "message" in data
+            ? String(data.message)
+            : String(data);
+        const error = new Error(message) as Error & { data?: unknown };
+        error.data = data;
+        throw error;
       }
     }
   }

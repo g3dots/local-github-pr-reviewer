@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PatchDiff, type DiffLineAnnotation } from "@pierre/diffs/react";
-import { api, postSse, type PRDetail, type Thread } from "../api.js";
+import { api, errorHasPersistedInput, postSse, type PRDetail, type Thread } from "../api.js";
 import { Markdown } from "../components/Markdown.js";
 import { ReviewSettingsPanel } from "../components/ReviewSettingsPanel.js";
 import type { ReviewConfigFields } from "../components/ReviewConfigEditor.js";
@@ -1142,13 +1142,19 @@ function ThreadCard({
 }) {
   const [reply, setReply] = useState("");
   const [streaming, setStreaming] = useState<null | "reply" | "revalidate">(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   async function sendReply() {
     if (!reply.trim()) return;
     setStreaming("reply");
+    setActionError(null);
     try {
       await postSse(`/api/threads/${thread.id}/messages`, { body: reply }, () => {});
       setReply("");
+      onChange();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+      if (errorHasPersistedInput(error)) setReply("");
       onChange();
     } finally {
       setStreaming(null);
@@ -1157,9 +1163,12 @@ function ThreadCard({
 
   async function revalidate() {
     setStreaming("revalidate");
+    setActionError(null);
     try {
       await postSse(`/api/threads/${thread.id}/revalidate`, {}, () => {});
       onChange();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
     } finally {
       setStreaming(null);
     }
@@ -1216,6 +1225,11 @@ function ThreadCard({
           >
             {streaming === "reply" ? "…" : "Send"}
           </button>
+        </div>
+      )}
+      {actionError && (
+        <div role="alert" className="small thread-action-error">
+          {actionError}
         </div>
       )}
     </div>

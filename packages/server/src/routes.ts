@@ -38,8 +38,8 @@ import { catalogForClient } from "./reviewCatalog.js";
 import { buildReviewInstructions } from "./providers/prompt.js";
 import {
   runReview,
-  runReply,
-  runRevalidate,
+  startReply,
+  startRevalidate,
   setThreadStatus,
   reconcileInterruptedReviews,
   getLatestReviewForPR,
@@ -485,8 +485,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
     sseInit(reply);
     sseSend(reply, "log", { message: `replying with ${providerId}…` });
+    let inputPersisted = false;
     try {
-      const result = await runReply({
+      const started = startReply({
         repo,
         pr,
         threadId,
@@ -494,9 +495,18 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
         providerId,
         onProgress: (e) => sseSend(reply, e.type, e),
       });
+      // Creators persist in the claim transaction; joiners attach only to an
+      // action with this exact input, so both cases already have the message.
+      inputPersisted = true;
+      if (!started.created) {
+        sseSend(reply, "log", {
+          message: `attached to active reply action ${started.actionId}; waiting for its result…`,
+        });
+      }
+      const result = await started.completion;
       sseSend(reply, "done", result);
     } catch (e) {
-      sseSend(reply, "error", { message: (e as Error).message });
+      sseSend(reply, "error", { message: (e as Error).message, inputPersisted });
     } finally {
       sseEnd(reply);
     }
@@ -517,13 +527,19 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     sseInit(reply);
     sseSend(reply, "log", { message: `revalidating with ${providerId}…` });
     try {
-      const result = await runRevalidate({
+      const started = startRevalidate({
         repo,
         pr,
         threadId,
         providerId,
         onProgress: (e) => sseSend(reply, e.type, e),
       });
+      if (!started.created) {
+        sseSend(reply, "log", {
+          message: `attached to active revalidation action ${started.actionId}; waiting for its result…`,
+        });
+      }
+      const result = await started.completion;
       sseSend(reply, "done", result);
     } catch (e) {
       sseSend(reply, "error", { message: (e as Error).message });
