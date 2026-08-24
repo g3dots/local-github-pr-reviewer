@@ -1,79 +1,48 @@
-import { spawn } from "node:child_process";
+import { spawnCli } from "./providers/spawn.js";
 
 /**
  * The ONLY module in this codebase that invokes the `gh` CLI.
  * Strictly read-only: no methods that mutate any GitHub state are exported,
- * and only safe subcommands are ever passed to spawn.
+ * and only safe subcommands are ever passed to the shared process-group runner.
  *
- * A unit test enforces that no other file calls spawn('gh', ...).
+ * A unit test enforces that no other file invokes the gh executable directly.
  */
 
 const ALLOWED_SUBCOMMANDS = new Set(["pr", "api", "auth"]);
 const ALLOWED_PR_VERBS = new Set(["list", "view", "diff"]);
 
-function ghJson<T>(args: string[]): Promise<T> {
-  return new Promise((resolveP, rejectP) => {
-    if (args.length === 0 || !ALLOWED_SUBCOMMANDS.has(args[0]!)) {
-      rejectP(new Error(`gh subcommand not allowed: ${args[0]}`));
-      return;
-    }
-    if (args[0] === "pr" && args[1] && !ALLOWED_PR_VERBS.has(args[1])) {
-      rejectP(new Error(`gh pr verb not allowed: ${args[1]}`));
-      return;
-    }
-    if (args[0] === "api") {
-      const hasMethod = args.some(
-        (a, i) => (a === "-X" || a === "--method") && args[i + 1] && args[i + 1] !== "GET",
-      );
-      if (hasMethod) {
-        rejectP(new Error("gh api: only GET is allowed"));
-        return;
-      }
-    }
-    const child = spawn("gh", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (b) => (stdout += b.toString()));
-    child.stderr.on("data", (b) => (stderr += b.toString()));
-    child.on("close", (code) => {
-      if (code !== 0) {
-        rejectP(new Error(`gh ${args.join(" ")} exited ${code}: ${stderr.trim()}`));
-        return;
-      }
-      try {
-        resolveP(stdout.trim() ? (JSON.parse(stdout) as T) : (undefined as unknown as T));
-      } catch (e) {
-        rejectP(new Error(`gh ${args.join(" ")} returned non-JSON: ${(e as Error).message}`));
-      }
-    });
-    child.on("error", rejectP);
-  });
+function validateGhArgs(args: string[]): void {
+  if (args.length === 0 || !ALLOWED_SUBCOMMANDS.has(args[0]!)) {
+    throw new Error(`gh subcommand not allowed: ${args[0]}`);
+  }
+  if (args[0] === "pr" && args[1] && !ALLOWED_PR_VERBS.has(args[1])) {
+    throw new Error(`gh pr verb not allowed: ${args[1]}`);
+  }
+  if (args[0] === "api") {
+    const hasMethod = args.some(
+      (arg, index) =>
+        (arg === "-X" || arg === "--method") && args[index + 1] && args[index + 1] !== "GET",
+    );
+    if (hasMethod) throw new Error("gh api: only GET is allowed");
+  }
 }
 
-function ghText(args: string[]): Promise<string> {
-  return new Promise((resolveP, rejectP) => {
-    if (args.length === 0 || !ALLOWED_SUBCOMMANDS.has(args[0]!)) {
-      rejectP(new Error(`gh subcommand not allowed: ${args[0]}`));
-      return;
-    }
-    if (args[0] === "pr" && args[1] && !ALLOWED_PR_VERBS.has(args[1])) {
-      rejectP(new Error(`gh pr verb not allowed: ${args[1]}`));
-      return;
-    }
-    const child = spawn("gh", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (b) => (stdout += b.toString()));
-    child.stderr.on("data", (b) => (stderr += b.toString()));
-    child.on("close", (code) => {
-      if (code !== 0) {
-        rejectP(new Error(`gh ${args.join(" ")} exited ${code}: ${stderr.trim()}`));
-        return;
-      }
-      resolveP(stdout);
-    });
-    child.on("error", rejectP);
-  });
+async function ghText(args: string[], signal?: AbortSignal): Promise<string> {
+  validateGhArgs(args);
+  const result = await spawnCli({ cmd: "gh", args, cwd: process.cwd(), signal });
+  if (result.exitCode !== 0) {
+    throw new Error(`gh ${args.join(" ")} exited ${result.exitCode}: ${result.stderr.trim()}`);
+  }
+  return result.stdout;
+}
+
+async function ghJson<T>(args: string[], signal?: AbortSignal): Promise<T> {
+  const stdout = await ghText(args, signal);
+  try {
+    return stdout.trim() ? (JSON.parse(stdout) as T) : (undefined as unknown as T);
+  } catch (error) {
+    throw new Error(`gh ${args.join(" ")} returned non-JSON: ${(error as Error).message}`);
+  }
 }
 
 export interface GhPRSummary {
@@ -153,20 +122,33 @@ export async function listClosedPRs(owner: string, name: string): Promise<GhPRSu
   return [...merged, ...closed];
 }
 
-export async function getPR(owner: string, name: string, number: number): Promise<GhPRDetail> {
-  return ghJson<GhPRDetail>([
-    "pr",
-    "view",
-    String(number),
-    "--repo",
-    `${owner}/${name}`,
-    "--json",
-    "number,title,state,headRefName,baseRefName,url,isDraft,createdAt,updatedAt,author,assignees,reviewRequests,body,headRefOid,baseRefOid,additions,deletions,changedFiles",
-  ]);
+export async function getPR(
+  owner: string,
+  name: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<GhPRDetail> {
+  return ghJson<GhPRDetail>(
+    [
+      "pr",
+      "view",
+      String(number),
+      "--repo",
+      `${owner}/${name}`,
+      "--json",
+      "number,title,state,headRefName,baseRefName,url,isDraft,createdAt,updatedAt,author,assignees,reviewRequests,body,headRefOid,baseRefOid,additions,deletions,changedFiles",
+    ],
+    signal,
+  );
 }
 
-export async function getPRDiff(owner: string, name: string, number: number): Promise<string> {
-  return ghText(["pr", "diff", String(number), "--repo", `${owner}/${name}`]);
+export async function getPRDiff(
+  owner: string,
+  name: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  return ghText(["pr", "diff", String(number), "--repo", `${owner}/${name}`], signal);
 }
 
 export interface GhFile {

@@ -10,8 +10,11 @@ import { z } from "zod";
 import * as api from "@reviewer/server/api";
 import { resolveJobStatus, type Job } from "./jobStatus.js";
 import { collectViewerPrs } from "./prDiscovery.js";
+import { handleAwaitReview } from "./awaitReview.js";
 
-let nextJobId = 1;
+// Ephemeral reply/revalidate jobs use negative IDs; positive review job IDs
+// are their durable SQLite review IDs and survive MCP process restarts.
+let nextJobId = -1;
 const jobs = new Map<number, Job>();
 const MAX_JOBS = 100;
 
@@ -20,7 +23,7 @@ function launchJob(
   promise: Promise<unknown>,
   metadata: Pick<Job, "reviewId" | "prId"> = {},
 ) {
-  const jobId = nextJobId++;
+  const jobId = metadata.reviewId ?? nextJobId--;
   const job: Job = {
     id: jobId,
     status: "running",
@@ -77,12 +80,14 @@ function launchJob(
 const server = new Server(
   {
     name: "reviewer-mcp",
-    version: "0.3.1",
+    version: "0.4.1",
   },
   {
     capabilities: {
       tools: {},
     },
+    instructions:
+      "Review lifecycle: call trigger_review once, then call await_review exactly once with the returned reviewId. Never poll get_job_status, create timers/watchers, or re-trigger an active review. trigger_review is idempotent across every Reviewer process, and await_review returns the committed threads as soon as they exist.",
   },
 );
 
@@ -304,7 +309,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "get_job_status",
         description:
-          "Checks an asynchronous job. Review jobs reconcile against persisted review state and return threads on completion; reviewId can recover status after an MCP restart.",
+          "Legacy non-blocking snapshot for an asynchronous job. Do not poll review jobs with this tool; call await_review once with the explicit reviewId instead. Only reviewId is guaranteed to survive MCP restarts; an uncached jobId is rejected to avoid confusing pre-0.4.1 job counters with unrelated reviews.",
         inputSchema: {
           type: "object",
           properties: {
@@ -315,13 +320,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "await_review",
+        description:
+          "Waits once for a review and returns its committed summary and threads immediately on completion. This is the canonical completion path: call it exactly once after trigger_review; do not build timers, poll get_job_status, or re-trigger the review.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            reviewId: { type: "number", description: "The durable ID returned by trigger_review" },
+            timeoutMs: {
+              type: "number",
+              minimum: 1000,
+              maximum: 1260000,
+              description:
+                "Maximum time for this wait call. Defaults to 21 minutes, one minute beyond the enforced total review lifecycle.",
+            },
+          },
+          required: ["reviewId"],
+        },
+      },
+      {
         name: "trigger_review",
         description:
-          "Runs the AI review using the PR provider override, repository default, or global default in that order.",
+          "Idempotently starts or joins the one active AI review for a PR and returns its durable reviewId immediately. Then call await_review exactly once; never poll or re-trigger while it is active.",
         inputSchema: {
           type: "object",
           properties: {
             prId: { type: "number" },
+            presetId: {
+              type: "number",
+              description: "Optional preset to apply before starting a new review",
+            },
           },
           required: ["prId"],
         },
@@ -378,7 +406,7 @@ function requirePr(prId: number) {
   return pr;
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   try {
     switch (request.params.name) {
       case "get_system_status": {
@@ -729,17 +757,74 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         return { content: [{ type: "text", text: JSON.stringify(resolved, null, 2) }] };
       }
+      case "await_review": {
+        const { reviewId, timeoutMs } = z
+          .object({
+            reviewId: z.number().int().positive(),
+            timeoutMs: z
+              .number()
+              .int()
+              .min(1_000)
+              .max(21 * 60 * 1_000)
+              .default(21 * 60 * 1_000),
+          })
+          .parse(request.params.arguments);
+        const resolved = await handleAwaitReview(
+          { reviewId, timeoutMs },
+          {
+            signal: extra.signal,
+            progressToken: request.params._meta?.progressToken,
+            sendProgress: (params) =>
+              extra.sendNotification({ method: "notifications/progress", params }),
+          },
+          {
+            waitForReview: api.waitForReview,
+            getReview: api.getReview,
+            getThreads: api.listThreadsForPR,
+            reconcileInterruptedReviews: api.reconcileInterruptedReviews,
+          },
+        );
+        return { content: [{ type: "text", text: JSON.stringify(resolved, null, 2) }] };
+      }
       case "trigger_review": {
-        const { prId } = z.object({ prId: z.number() }).parse(request.params.arguments);
+        const { prId, presetId } = z
+          .object({ prId: z.number(), presetId: z.number().int().positive().optional() })
+          .parse(request.params.arguments);
         const pr = requirePr(prId);
         const repo = requireRepo(pr.repo_id);
+        const preset =
+          presetId === undefined
+            ? undefined
+            : api.listPresets().find((candidate) => candidate.id === presetId);
+        if (presetId !== undefined && !preset) {
+          throw new McpError(ErrorCode.InvalidParams, `Preset ${presetId} not found`);
+        }
         const providerId = api.resolveReviewerProvider(repo, pr).provider;
 
-        const started = api.startReview({ repo, pr, providerId });
-        return launchJob("review", started.completion, {
+        const started = api.startReview({
+          repo,
+          pr,
+          providerId,
+          beforeCreate: preset
+            ? () =>
+                api.setPrReviewConfig(prId, {
+                  categories: preset.categories,
+                  strictness: preset.strictness,
+                  customRules: preset.customRules,
+                })
+            : undefined,
+        });
+        const launched = launchJob("review", started.completion, {
           reviewId: started.reviewId,
           prId,
         });
+        const payload = JSON.parse(launched.content[0]!.text) as Record<string, unknown>;
+        payload.created = started.created;
+        payload.joined = !started.created;
+        payload.nextAction =
+          "Call await_review once with this reviewId. Do not poll get_job_status or trigger another review.";
+        launched.content[0]!.text = JSON.stringify(payload, null, 2);
+        return launched;
       }
       case "reply_to_thread": {
         const { threadId, message } = z
@@ -795,6 +880,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function main() {
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const) {
+    const shutdown = () => {
+      process.removeListener(signal, shutdown);
+      api.abortLocalReviewWork();
+      void api.shutdownActiveCliChildren().then(() => process.kill(process.pid, signal));
+    };
+    process.once(signal, shutdown);
+  }
   const pruneStale = () =>
     api.pruneStaleWorktrees(api.listRepos()).catch((error) => {
       console.error(`Reviewer MCP worktree pruning failed: ${String(error)}`);

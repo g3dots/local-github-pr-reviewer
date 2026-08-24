@@ -10,6 +10,8 @@ export interface Job {
   prId?: number;
   startedAt: string;
   completedAt?: string;
+  statusMessage?: string;
+  nextAction?: string;
 }
 
 export interface JobStatusQuery {
@@ -42,6 +44,8 @@ export function reconcileReviewJob(job: Job, review: ReviewRow): Job {
       headSha: review.head_sha,
       summary: review.summary,
       finishedAt: review.finished_at,
+      addedThreads: review.added_threads,
+      staleMarked: review.stale_marked,
       threadsReady: true,
     };
     delete next.error;
@@ -51,6 +55,13 @@ export function reconcileReviewJob(job: Job, review: ReviewRow): Job {
     next.error = review.error ?? "Review failed.";
   } else {
     next.status = "running";
+    const elapsedSeconds = Math.max(
+      0,
+      Math.round((Date.now() - Date.parse(review.started_at)) / 1_000),
+    );
+    next.statusMessage = `Review ${review.id} is healthy and still running (${elapsedSeconds}s elapsed; last heartbeat ${review.heartbeat_at ?? "pending"}).`;
+    next.nextAction =
+      "Call await_review once with this reviewId. Do not poll get_job_status or trigger another review.";
   }
 
   return next;
@@ -58,6 +69,9 @@ export function reconcileReviewJob(job: Job, review: ReviewRow): Job {
 
 export function resolveJobStatus(query: JobStatusQuery, deps: JobStatusDeps): Job {
   const existingJob = query.jobId === undefined ? undefined : deps.getJob(query.jobId);
+  // A pre-0.4.1 positive job id was an unrelated in-memory counter, so an
+  // uncached jobId must never be guessed to be a persisted review id. The
+  // explicit reviewId is the restart-safe handle returned by trigger_review.
   const reviewId = query.reviewId ?? existingJob?.reviewId;
 
   if (reviewId !== undefined) {

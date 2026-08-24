@@ -19,6 +19,8 @@ import * as gh from "./github.js";
 import { hydratePR } from "./prs.js";
 import { recordSessions } from "./sessions.js";
 import { preparePrHeadWorktree, type PrWorktree } from "./prWorktree.js";
+import { randomUUID } from "node:crypto";
+import type Database from "better-sqlite3";
 
 function now(): string {
   return new Date().toISOString();
@@ -26,20 +28,51 @@ function now(): string {
 
 const REVIEW_HEARTBEAT_MS = 5_000;
 const REVIEW_STALE_AFTER_MS = 30_000;
+const REVIEW_HARD_STALE_AFTER_MS = 20 * 60 * 1_000;
+const REVIEW_EXECUTION_TIMEOUT_MS = 20 * 60 * 1_000;
 
-export function reconcileInterruptedReviews(): number {
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function reconcileInterruptedReviews(db: Database.Database = getDb()): number {
   const finishedAt = now();
   const staleBefore = new Date(Date.now() - REVIEW_STALE_AFTER_MS).toISOString();
-  return getDb()
+  const hardStaleBefore = new Date(Date.now() - REVIEW_HARD_STALE_AFTER_MS).toISOString();
+  const candidates = db
     .prepare(
-      `
-      UPDATE reviews
-      SET status = 'error', finished_at = ?, error = 'Review interrupted before completion.'
-      WHERE status = 'running'
-        AND (heartbeat_at IS NULL OR heartbeat_at < ?)
-    `,
+      `SELECT id, worker_pid, heartbeat_at
+       FROM reviews
+       WHERE status = 'running'
+         AND (heartbeat_at IS NULL OR heartbeat_at < ?)`,
     )
-    .run(finishedAt, staleBefore).changes;
+    .all(staleBefore) as Pick<ReviewRow, "id" | "worker_pid" | "heartbeat_at">[];
+  const interrupt = db.prepare(
+    `UPDATE reviews
+     SET status = 'error', finished_at = ?, error = 'Review interrupted before completion.'
+     WHERE id = ? AND status = 'running'`,
+  );
+  let changed = 0;
+  for (const review of candidates) {
+    // Laptop sleep pauses the worker and its heartbeat together. A living
+    // owner PID is stronger liveness evidence than the clock until the hard
+    // ceiling, after which a wedged process may be safely fenced and replaced.
+    if (
+      review.worker_pid !== null &&
+      isProcessAlive(review.worker_pid) &&
+      review.heartbeat_at !== null &&
+      review.heartbeat_at >= hardStaleBefore
+    ) {
+      continue;
+    }
+    changed += interrupt.run(finishedAt, review.id).changes;
+  }
+  return changed;
 }
 
 function fingerprint(path: string | null, line: number | null, body: string): string {
@@ -52,6 +85,8 @@ export interface RunReviewArgs {
   pr: PrRow;
   providerId: string;
   onProgress?: ProviderProgress;
+  /** Runs only for the caller that wins the cross-process review claim. */
+  beforeCreate?: () => void;
 }
 
 export interface RunReviewResult {
@@ -62,7 +97,125 @@ export interface RunReviewResult {
 
 export interface StartedReview {
   reviewId: number;
+  created: boolean;
   completion: Promise<RunReviewResult>;
+}
+
+export interface ReviewClaimArgs {
+  prId: number;
+  headSha: string;
+  providerId: string;
+  startedAt: string;
+  workerToken: string;
+  workerPid: number;
+  beforeClaim?: () => void;
+  beforeCreate?: () => void;
+}
+
+/** The small, synchronous cross-process critical section for review ownership. */
+export function claimReview(
+  db: Database.Database,
+  args: ReviewClaimArgs,
+): { reviewId: number; created: boolean; workerToken?: string } {
+  return db
+    .transaction((): { reviewId: number; created: boolean; workerToken?: string } => {
+      args.beforeClaim?.();
+      const active = db
+        .prepare(
+          "SELECT id FROM reviews WHERE pr_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+        )
+        .get(args.prId) as { id: number } | undefined;
+      if (active) return { reviewId: active.id, created: false };
+
+      args.beforeCreate?.();
+      const reviewId = Number(
+        db
+          .prepare(
+            `INSERT INTO reviews
+               (pr_id, head_sha, provider, status, started_at, heartbeat_at, worker_token, worker_pid)
+             VALUES (?, ?, ?, 'running', ?, ?, ?, ?)`,
+          )
+          .run(
+            args.prId,
+            args.headSha,
+            args.providerId,
+            args.startedAt,
+            args.startedAt,
+            args.workerToken,
+            args.workerPid,
+          ).lastInsertRowid,
+      );
+      return { reviewId, created: true, workerToken: args.workerToken };
+    })
+    .immediate();
+}
+
+export interface WaitForReviewOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  onProgress?: (review: ReviewRow) => void;
+}
+
+const REVIEW_WAIT_TIMEOUT_MS = 21 * 60 * 1_000;
+const REVIEW_POLL_INTERVAL_MS = 250;
+const localJoinedWaiters = new Set<AbortController>();
+const localReviewExecutions = new Set<AbortController>();
+
+export function abortLocalReviewWork(
+  reason: Error = new Error("Reviewer process is shutting down."),
+): number {
+  const controllers = new Set([...localJoinedWaiters, ...localReviewExecutions]);
+  for (const controller of controllers) controller.abort(reason);
+  return controllers.size;
+}
+
+function waitForDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error("Review wait cancelled."));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("Review wait cancelled."));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * Wait on canonical persisted state rather than the provider promise owned by
+ * one MCP process. This makes completion observable across reconnects and
+ * returns as soon as the transaction publishing review results commits.
+ */
+export async function waitForReview(
+  reviewId: number,
+  options: WaitForReviewOptions = {},
+): Promise<ReviewRow> {
+  const started = Date.now();
+  const timeoutMs = options.timeoutMs ?? REVIEW_WAIT_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? REVIEW_POLL_INTERVAL_MS;
+
+  for (;;) {
+    reconcileInterruptedReviews();
+    const review = getReview(reviewId);
+    if (!review) throw new Error(`Review ${reviewId} not found.`);
+    if (review.status === "done") return review;
+    if (review.status === "error") throw new Error(review.error ?? `Review ${reviewId} failed.`);
+    if (Date.now() - started >= timeoutMs) {
+      throw new Error(
+        `Timed out waiting for review ${reviewId} after ${Math.ceil(timeoutMs / 1_000)} seconds; the review remains active and can be awaited again safely.`,
+      );
+    }
+    options.onProgress?.(review);
+    await waitForDelay(pollIntervalMs, options.signal);
+  }
 }
 
 function cleanupWorktreeInBackground(wt: PrWorktree): void {
@@ -74,22 +227,48 @@ function cleanupWorktreeInBackground(wt: PrWorktree): void {
 }
 
 export function startReview(args: RunReviewArgs): StartedReview {
-  const { repo, pr, providerId, onProgress } = args;
+  const { repo, pr, providerId, onProgress, beforeCreate } = args;
   const provider = getProvider(providerId);
   const db = getDb();
 
-  const reviewInsert = db.prepare(`
-    INSERT INTO reviews (pr_id, head_sha, provider, status, started_at, heartbeat_at)
-    VALUES (?, ?, ?, 'running', ?, ?)
-  `);
-  const startedAt = now();
-  const reviewId = Number(
-    reviewInsert.run(pr.id, pr.head_sha, providerId, startedAt, startedAt).lastInsertRowid,
-  );
+  // A SQLite write transaction is the cross-process lock. Every UI and MCP
+  // server shares this database, so only the winner inserts and runs a
+  // provider; all concurrent callers join the same durable review.
+  const claim = claimReview(db, {
+    prId: pr.id,
+    headSha: pr.head_sha,
+    providerId,
+    startedAt: now(),
+    workerToken: randomUUID(),
+    workerPid: process.pid,
+    beforeClaim: () => reconcileInterruptedReviews(db),
+    beforeCreate,
+  });
+
+  if (!claim.created) {
+    const waitController = new AbortController();
+    localJoinedWaiters.add(waitController);
+    return {
+      ...claim,
+      completion: waitForReview(claim.reviewId, { signal: waitController.signal })
+        .then((review) => ({
+          reviewId: claim.reviewId,
+          addedThreads: review.added_threads ?? 0,
+          staleMarked: review.stale_marked ?? 0,
+        }))
+        .finally(() => localJoinedWaiters.delete(waitController)),
+    };
+  }
 
   return {
-    reviewId,
-    completion: completeReview({ repo, pr, providerId, onProgress }, reviewId, provider, db),
+    ...claim,
+    completion: completeReview(
+      { repo, pr, providerId, onProgress },
+      claim.reviewId,
+      claim.workerToken!,
+      provider,
+      db,
+    ),
   };
 }
 
@@ -100,23 +279,48 @@ export function runReview(args: RunReviewArgs): Promise<RunReviewResult> {
 async function completeReview(
   args: RunReviewArgs,
   reviewId: number,
+  workerToken: string,
   provider: ReturnType<typeof getProvider>,
   db: ReturnType<typeof getDb>,
 ): Promise<RunReviewResult> {
   const { repo, pr, providerId, onProgress } = args;
   const heartbeat = db.prepare(
-    "UPDATE reviews SET heartbeat_at = ? WHERE id = ? AND status = 'running'",
+    "UPDATE reviews SET heartbeat_at = ? WHERE id = ? AND worker_token = ? AND status = 'running'",
   );
-  const heartbeatTimer = setInterval(() => heartbeat.run(now(), reviewId), REVIEW_HEARTBEAT_MS);
+  const heartbeatTimer = setInterval(
+    () => heartbeat.run(now(), reviewId, workerToken),
+    REVIEW_HEARTBEAT_MS,
+  );
 
   const reviewFinish = db.prepare(`
-    UPDATE reviews SET status = ?, summary = ?, finished_at = ?, error = ? WHERE id = ?
+    UPDATE reviews
+    SET status = ?, summary = ?, finished_at = ?, error = ?,
+        added_threads = ?, stale_marked = ?
+    WHERE id = ? AND worker_token = ? AND status = 'running'
   `);
+  const executionController = new AbortController();
+  localReviewExecutions.add(executionController);
+  const lifecycleError = new Error(
+    `Review exceeded the ${Math.round(REVIEW_EXECUTION_TIMEOUT_MS / 60_000)}-minute total lifecycle limit.`,
+  );
+  const executionTimer = setTimeout(
+    () => executionController.abort(lifecycleError),
+    REVIEW_EXECUTION_TIMEOUT_MS,
+  );
+  executionTimer.unref?.();
+  const assertLease = () => {
+    const ownership = db
+      .prepare("SELECT 1 FROM reviews WHERE id = ? AND worker_token = ? AND status = 'running'")
+      .get(reviewId, workerToken);
+    if (!ownership) throw new Error(`Review ${reviewId} lost its worker lease before publication.`);
+  };
 
   try {
-    const refreshed = await hydratePR(repo, pr.number);
+    const refreshed = await hydratePR(repo, pr.number, executionController.signal);
+    assertLease();
     db.prepare("UPDATE reviews SET head_sha = ? WHERE id = ?").run(refreshed.head_sha, reviewId);
-    const diff = await gh.getPRDiff(repo.owner, repo.name, pr.number);
+    const diff = await gh.getPRDiff(repo.owner, repo.name, pr.number, executionController.signal);
+    assertLease();
 
     const skills = getSkills(repo.id);
     const prConfig = getPrReviewConfig(refreshed.id);
@@ -133,18 +337,14 @@ async function completeReview(
       )
       .all(refreshed.id) as (ThreadRow & { first_body: string | null })[];
 
-    // Mark threads on a different head_sha as stale (not resolved — user-only resolves)
-    let staleMarked = 0;
-    if (existingOpen.length > 0) {
-      const stmt = db.prepare("UPDATE threads SET stale = 1 WHERE id = ? AND last_seen_sha != ?");
-      for (const t of existingOpen) {
-        const r = stmt.run(t.id, refreshed.head_sha);
-        staleMarked += r.changes;
-      }
-    }
-
-    const wt = await preparePrHeadWorktree({ repo, pr: refreshed, onProgress });
+    const wt = await preparePrHeadWorktree({
+      repo,
+      pr: refreshed,
+      onProgress,
+      signal: executionController.signal,
+    });
     try {
+      assertLease();
       const ctx: ReviewContext = {
         cwd: wt.cwd,
         prTitle: refreshed.title,
@@ -171,7 +371,8 @@ async function completeReview(
         })),
       };
 
-      const result = await provider.review(ctx, onProgress);
+      const result = await provider.review(ctx, onProgress, executionController.signal);
+      assertLease();
       recordSessions(refreshed.id, providerId, result.sessionIds, wt.cwd);
 
       // Dedupe + insert
@@ -179,6 +380,7 @@ async function completeReview(
         existingOpen.map((t) => fingerprint(t.file_path, t.line, t.first_body ?? "")),
       );
       let added = 0;
+      let staleMarked = 0;
 
       const insertThread = db.prepare(`
       INSERT INTO threads (pr_id, file_path, line, side, severity, status, first_seen_sha, last_seen_sha, stale, created_at)
@@ -190,6 +392,16 @@ async function completeReview(
     `);
 
       const tx = db.transaction(() => {
+        assertLease();
+        // Staleness is review output too. Publish it in the terminal
+        // transaction so a failed, cancelled, or fenced review changes no
+        // user-visible thread state.
+        const markStale = db.prepare(
+          "UPDATE threads SET stale = 1 WHERE id = ? AND last_seen_sha != ?",
+        );
+        for (const thread of existingOpen) {
+          staleMarked += markStale.run(thread.id, refreshed.head_sha).changes;
+        }
         for (const c of result.comments) {
           const fp = fingerprint(c.path, c.line, c.body);
           if (existingFps.has(fp)) continue;
@@ -208,19 +420,35 @@ async function completeReview(
           insertComment.run(tid, c.body, refreshed.head_sha, now());
           added++;
         }
+        // Publish the terminal state in the same commit as its threads. A
+        // waiter can therefore never observe "done" without all findings or
+        // findings that belong to a still-running review.
+        const published = reviewFinish.run(
+          "done",
+          result.summary,
+          now(),
+          null,
+          added,
+          staleMarked,
+          reviewId,
+          workerToken,
+        );
+        if (published.changes !== 1) {
+          throw new Error(`Review ${reviewId} lost its worker lease before publication.`);
+        }
       });
       tx();
-
-      reviewFinish.run("done", result.summary, now(), null, reviewId);
       return { reviewId, addedThreads: added, staleMarked };
     } finally {
       cleanupWorktreeInBackground(wt);
     }
   } catch (e) {
-    reviewFinish.run("error", null, now(), (e as Error).message, reviewId);
+    reviewFinish.run("error", null, now(), (e as Error).message, null, null, reviewId, workerToken);
     throw e;
   } finally {
+    localReviewExecutions.delete(executionController);
     clearInterval(heartbeatTimer);
+    clearTimeout(executionTimer);
   }
 }
 

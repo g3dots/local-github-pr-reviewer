@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { readdir, rm, stat } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { dataDir } from "./config.js";
 import type { RepoRow, PrRow } from "./db.js";
 import type { ProviderProgress } from "./providers/types.js";
+import { spawnCli } from "./providers/spawn.js";
 
 export interface PrWorktree {
   cwd: string;
@@ -14,58 +14,25 @@ export interface PrWorktree {
 const WORKTREE_CLEANUP_TIMEOUT_MS = 30_000;
 const STALE_WORKTREE_AFTER_MS = 30 * 60 * 1_000;
 
-function runGit(
+async function runGit(
   args: string[],
   cwd: string,
   onProgress?: ProviderProgress,
   timeoutMs?: number,
+  signal?: AbortSignal,
 ): Promise<string> {
-  return new Promise((resolveP, rejectP) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timer: NodeJS.Timeout | undefined;
-    let forceKillTimer: NodeJS.Timeout | undefined;
-
-    if (timeoutMs) {
-      timer = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        child.kill("SIGTERM");
-        forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
-        rejectP(new Error(`git ${args.join(" ")} timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    }
-    child.stdout.on("data", (b) => {
-      const s = b.toString();
-      stdout += s;
-      onProgress?.({ type: "stdout", data: s });
-    });
-    child.stderr.on("data", (b) => {
-      const s = b.toString();
-      stderr += s;
-      onProgress?.({ type: "stderr", data: s });
-    });
-    child.on("close", (code) => {
-      if (timer) clearTimeout(timer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (settled) return;
-      settled = true;
-      if (code !== 0) {
-        rejectP(new Error(`git ${args.join(" ")} exited ${code}: ${stderr.trim()}`));
-        return;
-      }
-      resolveP(stdout.trim());
-    });
-    child.on("error", (error) => {
-      if (timer) clearTimeout(timer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (settled) return;
-      settled = true;
-      rejectP(error);
-    });
+  const result = await spawnCli({
+    cmd: "git",
+    args,
+    cwd,
+    onProgress,
+    timeoutMs,
+    signal,
   });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} exited ${result.exitCode}: ${result.stderr.trim()}`);
+  }
+  return result.stdout.trim();
 }
 
 export async function pruneWorktrees(repos: RepoRow[]): Promise<void> {
@@ -147,8 +114,9 @@ export async function preparePrHeadWorktree(args: {
   repo: RepoRow;
   pr: Pick<PrRow, "number" | "head_sha">;
   onProgress?: ProviderProgress;
+  signal?: AbortSignal;
 }): Promise<PrWorktree> {
-  const { repo, pr, onProgress } = args;
+  const { repo, pr, onProgress, signal } = args;
 
   onProgress?.({
     type: "log",
@@ -167,10 +135,18 @@ export async function preparePrHeadWorktree(args: {
     ["fetch", "--no-tags", "origin", `+refs/pull/${pr.number}/head:${ref}`],
     repo.local_path,
     onProgress,
+    undefined,
+    signal,
   );
 
   // Verify the fetched ref matches the expected head_sha
-  const fetchedSha = await runGit(["rev-parse", ref], repo.local_path, onProgress);
+  const fetchedSha = await runGit(
+    ["rev-parse", ref],
+    repo.local_path,
+    onProgress,
+    undefined,
+    signal,
+  );
   if (fetchedSha !== pr.head_sha) {
     throw new Error(`Fetched SHA (${fetchedSha}) does not match PR head_sha (${pr.head_sha})`);
   }
@@ -180,6 +156,8 @@ export async function preparePrHeadWorktree(args: {
     ["worktree", "add", "--detach", worktreePath, pr.head_sha],
     repo.local_path,
     onProgress,
+    undefined,
+    signal,
   );
 
   return {

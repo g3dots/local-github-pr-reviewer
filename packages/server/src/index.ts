@@ -9,6 +9,8 @@ import { syncReposFromConfig, listRepos } from "./db.js";
 import { purgeClosedForRepo } from "./prs.js";
 import { pruneStaleWorktrees } from "./prWorktree.js";
 import { registerRoutes } from "./routes.js";
+import { shutdownActiveCliChildren } from "./providers/spawn.js";
+import { abortLocalReviewWork } from "./review.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = resolve(__dirname, "../../..");
@@ -46,8 +48,9 @@ function removePidFile(): void {
 
 async function gracefulShutdown(app: FastifyInstance, signal: string): Promise<void> {
   app.log.info(`received ${signal}, shutting down…`);
+  abortLocalReviewWork();
   try {
-    await app.close();
+    await Promise.all([app.close(), shutdownActiveCliChildren()]);
   } catch (e) {
     app.log.error(`error during shutdown: ${(e as Error).message}`);
   } finally {
