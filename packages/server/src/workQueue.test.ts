@@ -13,6 +13,7 @@ import {
   pruneFinishedWorkEvents,
   reconcileInterruptedWorkItems,
   resolveWorkerLaunch,
+  waitForWorkItem,
 } from "./workQueue.js";
 
 const mocks = vi.hoisted(() => ({
@@ -47,7 +48,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => mocks.db.close());
+afterEach(() => {
+  vi.restoreAllMocks();
+  mocks.db.close();
+});
 
 describe("durable Reviewer work queue", () => {
   it("deduplicates active requests before launching detached workers", () => {
@@ -89,6 +93,36 @@ describe("durable Reviewer work queue", () => {
         event: JSON.stringify({ type: "stderr", data: "reviewing file.ts" }),
       }),
     ]);
+  });
+
+  it("reports durable work state while a caller waits", async () => {
+    const queued = enqueueWork({ kind: "review", prId: 18 });
+    const claim = claimWorkItem(queued.workId)!;
+    const states: string[] = [];
+    const waiting = waitForWorkItem(queued.workId, {
+      onProgress: (work) => states.push(work.status),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    completeWorkItem(queued.workId, claim.workerToken, {});
+    await waiting;
+
+    expect(states[0]).toBe("running");
+    expect(states.at(-1)).toBe("done");
+  });
+
+  it("allows a durable caller to wait without the default deadline", async () => {
+    const dateNow = vi.spyOn(Date, "now");
+    dateNow.mockReturnValue(0);
+    const queued = enqueueWork({ kind: "review", prId: 19 });
+    const claim = claimWorkItem(queued.workId)!;
+    const waiting = waitForWorkItem(queued.workId, { timeoutMs: null });
+
+    dateNow.mockReturnValue(22 * 60 * 1_000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    completeWorkItem(queued.workId, claim.workerToken, {});
+
+    await expect(waiting).resolves.toMatchObject({ status: "done" });
+    dateNow.mockRestore();
   });
 
   it("allows only one process to claim and publish a queued item", () => {
