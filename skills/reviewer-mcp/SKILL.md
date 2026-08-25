@@ -39,7 +39,7 @@ Every open, non-stale finding must receive an explicit disposition before anothe
 - **Patch and resolve:** Use `set_thread_status` with `resolved` when the correction is straightforward and independently verified, so another AI pass would add little value.
 - **Dismiss and resolve:** When the finding is incorrect, irrelevant, outside scope, or based on missing context, retain control of the decision. Prefer adding a concise local rationale with `reply_to_thread` when it will help future readers, then mark the thread resolved.
 
-`revalidate_thread` and `reply_to_thread` use the same capability-adaptive behavior: native MCP Tasks on capable hosts and progress-kept durable calls on legacy hosts. Call the chosen action once and use its terminal result. Do not call `await_thread_action`, poll `get_job_status`, or repeat the mutation because a bridge was recycled.
+`revalidate_thread` and `reply_to_thread` use the same capability-adaptive behavior: native MCP Tasks on capable hosts and progress-kept durable calls on legacy hosts. Call the chosen action once and use its terminal result. Do not call `await_thread_action`, poll `get_job_status`, or repeat the mutation because a bridge was recycled, except for the correlated one-shot transport-timeout recovery below.
 
 Never leave an addressed or dismissed thread open and start another full review. First revalidate or resolve all prior findings. If patches changed the PR head, run one fresh full review afterward so the final gate covers the new SHA.
 
@@ -48,10 +48,12 @@ Do not enter an endless review-fix loop. Address material correctness, security,
 ## Recovery
 
 - Reviewer persists every operation before waiting. Task-capable hosts recover it with `tasks/get` and `tasks/result`; legacy hosts receive periodic progress on the original call. Neither mode requires the agent to construct timers, polling loops, or database readers.
+- A host-level `Request timed out` or transport timeout is not a terminal Reviewer result. Call `get_review_threads` once for the PR. If its latest review for the expected head is complete, use that committed snapshot. If it is still running, call `trigger_review` one more time with identical arguments to join the active work item. If no review exists for that head, retry once because the request may have failed before enqueue. This single recovery check and optional reattachment is the sole exception to the no-repeat rule; never loop.
+- Before calling `reply_to_thread` or `revalidate_thread`, retain the action type and call start time for recovery. If it times out at the transport layer, call `get_thread_action` once with the thread ID. Treat the snapshot as this call only when its type matches and `startedAt` is not older than the call start. Use a matching terminal result when complete; retry the identical action once when it is matching and active, or when no matching action was claimed yet. Do not treat an older action as the result of the timed-out call.
 - If a detached worker disappears, Reviewer fences its lease and retries safely. A stale worker cannot publish after recovery.
 - If the operation returns a terminal error after bounded worker retries, report the precise error and correct the cause only within the user's authorized scope. A later review may use one new `trigger_review` call.
 - If the PR head changed after a completed review, that result does not gate the new head. Finish disposition of its threads, refresh the PR, and trigger one new review; let the call return its terminal result.
-- Never repeat a reply or revalidation merely because its original connection closed; its work item remains durable independently of the bridge.
+- Never repeat a reply or revalidation merely because its original connection closed. Only the correlated one-shot transport-timeout recovery above may reattach or retry the identical action; never retry speculatively or loop.
 
 Do not call `clear_pr_review` as ordinary recovery. It deletes local review history and threads; use it only when the user explicitly wants that data cleared or a task specifically requires a clean slate.
 
@@ -59,7 +61,7 @@ Do not call `clear_pr_review` as ordinary recovery. It deletes local review hist
 
 A review gate passes only when all of these are true:
 
-- `trigger_review` returned its terminal result with status `completed`, not a terminal error.
+- `trigger_review` returned its terminal result with status `completed`, or one post-timeout `get_review_threads` recovery snapshot confirms that the latest review for the expected head completed and its threads are committed.
 - The completed review `headSha` equals the refreshed PR `head_sha`.
 - Every prior open, non-stale finding was patched and revalidated/resolved, or deliberately dismissed and resolved.
 - The final result contains no open, non-stale thread that the implementing agent judges actionable under the requested review policy.
@@ -75,7 +77,7 @@ Never:
 - call legacy `await_review` or `await_thread_action` after starting a durable operation;
 - poll `get_job_status` for a review, reply, or revalidation action;
 - create timers, watchers, database readers, or background tasks to race the durable operation;
-- call `trigger_review` repeatedly while a review is active;
+- call `trigger_review` repeatedly while a review is active, except for the single identical reattachment after an explicit host transport timeout described above;
 - start a new full review while previous actionable threads remain open;
 - infer completion from `openThreads`, silence, elapsed time, or the UI alone;
 - treat a legacy `jobId` as restart-safe;
