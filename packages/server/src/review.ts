@@ -8,9 +8,11 @@ import {
   type ThreadActionRow,
 } from "./db.js";
 import { getProvider } from "./providers/index.js";
+import { ReviewOutputParseError } from "./providers/parser.js";
 import type {
   ProviderProgress,
   ReviewContext,
+  ReviewResult,
   ReplyContext,
   RevalidateContext,
 } from "./providers/types.js";
@@ -22,6 +24,11 @@ import { recordSessions } from "./sessions.js";
 import { preparePrHeadWorktree, type PrWorktree } from "./prWorktree.js";
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
+import {
+  DURABLE_EXECUTION_TIMEOUT_MS,
+  DURABLE_WAIT_TIMEOUT_MS,
+  THREAD_ACTION_EXECUTION_TIMEOUT_MS,
+} from "./timing.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -37,9 +44,16 @@ const DURABLE_STALE_AFTER_MS =
   Number.isFinite(configuredStaleAfterMs) && configuredStaleAfterMs >= 250
     ? configuredStaleAfterMs
     : 30_000;
-const DURABLE_EXECUTION_TIMEOUT_MS = 20 * 60 * 1_000;
-const DURABLE_WAIT_TIMEOUT_MS = 21 * 60 * 1_000;
 const DURABLE_POLL_INTERVAL_MS = 250;
+const MAX_PROVIDER_OUTPUT_ATTEMPTS = 2;
+
+function providerOutputExcerpt(raw: string, maxLength = 500): string {
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const excerpt = normalized.slice(0, maxLength);
+  const suffix = normalized.length > maxLength ? "…" : "";
+  return ` Output excerpt: ${JSON.stringify(`${excerpt}${suffix}`)}.`;
+}
 
 function reconcileInterruptedWork(
   db: Database.Database,
@@ -406,7 +420,28 @@ async function completeReview(
         })),
       };
 
-      const result = await provider.review(ctx, onProgress, executionController.signal);
+      let result: ReviewResult | undefined;
+      let attemptContext = ctx;
+      for (let attempt = 1; attempt <= MAX_PROVIDER_OUTPUT_ATTEMPTS; attempt++) {
+        try {
+          result = await provider.review(attemptContext, onProgress, executionController.signal);
+          break;
+        } catch (error) {
+          if (!(error instanceof ReviewOutputParseError)) throw error;
+          recordSessions(refreshed.id, providerId, error.sessionIds, wt.cwd);
+          if (attempt === MAX_PROVIDER_OUTPUT_ATTEMPTS) {
+            throw new Error(
+              `AI reviewer output was invalid after ${MAX_PROVIDER_OUTPUT_ATTEMPTS} attempts. ${error.message}${providerOutputExcerpt(error.rawOutput)}`,
+            );
+          }
+          onProgress?.({
+            type: "log",
+            data: `[reviewer] ${error.message} Retrying the provider once.\n`,
+          });
+          attemptContext = { ...ctx, retryFeedback: error.message };
+        }
+      }
+      if (!result) throw new Error("AI reviewer produced no validated result.");
       assertLease();
       recordSessions(refreshed.id, providerId, result.sessionIds, wt.cwd);
 
@@ -644,11 +679,11 @@ function startThreadAction<T>(args: {
   const executionController = new AbortController();
   localThreadActionExecutions.add(executionController);
   const lifecycleError = new Error(
-    `Thread action exceeded the ${Math.round(DURABLE_EXECUTION_TIMEOUT_MS / 60_000)}-minute total lifecycle limit.`,
+    `Thread action exceeded the ${Math.round(THREAD_ACTION_EXECUTION_TIMEOUT_MS / 60_000)}-minute total lifecycle limit.`,
   );
   const executionTimer = setTimeout(
     () => executionController.abort(lifecycleError),
-    DURABLE_EXECUTION_TIMEOUT_MS,
+    THREAD_ACTION_EXECUTION_TIMEOUT_MS,
   );
   executionTimer.unref?.();
   const heartbeat = db.prepare(
